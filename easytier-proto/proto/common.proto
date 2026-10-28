@@ -245,6 +245,44 @@ message StunInfo {
   repeated string public_ip = 4;
   uint32 min_port = 5;
   uint32 max_port = 6;
+
+  // Number of distinct underlay egresses observed behind a multi-WAN CPE.
+  // Zero means "not reported" (older peer, or the probe never ran); readers
+  // must treat zero as a single egress.
+  uint32 egress_count = 7;
+
+  // Per-egress STUN observations, restricted to egresses a peer can actually
+  // punch at: each entry has a single stable port. Egresses that map a port per
+  // destination are omitted, because naming one of their ports would send peers
+  // to a port the CPE opened for a different destination. Empty when no egress
+  // is punchable, or when the host reported none (single egress, where
+  // `min_port`/`max_port` already describe it).
+  //
+  // `egress_count` still counts every observed egress, including omitted ones.
+  repeated EgressEndpoint egress_endpoints = 8;
+
+  // Classification of this host when each egress is judged on its own.
+  //
+  // `udp_nat_type` stays `Symmetric` whenever no egress is punchable, so peers
+  // that predate this field keep relaying instead of punching at an address
+  // that cannot work. When at least one egress is punchable the plain field is
+  // accurate too, and readers that understand this field use this value.
+  // Unknown when not reported.
+  NatType multi_egress_udp_nat_type = 9;
+
+  // Whether repeating a probe to one STUN server kept the same mapping. This is
+  // what separates a CPE that pins an egress per flow (punchable) from one that
+  // spreads a single flow across WANs (never punchable). Unset when no repeat
+  // probe completed, which is not the same as "unstable".
+  optional bool egress_mapping_stable = 10;
+}
+
+// One observed underlay egress: the public address a multi-WAN CPE selects
+// for a given destination, plus the ports that egress was seen to map.
+message EgressEndpoint {
+  string public_ip = 1;
+  uint32 min_port = 2;
+  uint32 max_port = 3;
 }
 
 message PeerFeatureFlag {
@@ -259,6 +297,10 @@ message PeerFeatureFlag {
   bool need_p2p = 9;
   bool disable_p2p = 10;
   bool ipv6_public_addr_provider = 11;
+  // Peer understands `StunInfo.multi_egress_udp_nat_type` and
+  // `SelectPunchListenerResponse.endpoints`, so it can punch through a
+  // multi-WAN CPE that selects an egress per destination.
+  bool multi_egress_v1 = 12;
 }
 
 enum SocketType {

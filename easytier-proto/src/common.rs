@@ -14,6 +14,46 @@ const IP_SCHEMES: &[&str] = &["tcp", "udp", "wg", "quic", "ws", "wss", "faketcp"
 include!(concat!(env!("OUT_DIR"), "/common.rs"));
 include!(concat!(env!("OUT_DIR"), "/common.serde.rs"));
 
+impl StunInfo {
+    /// The NAT type to reason about when the peer on the other end understands
+    /// per-egress classification.
+    ///
+    /// Behind a multi-WAN CPE that picks an egress per destination, the plain
+    /// `udp_nat_type` is pinned to `Symmetric` so older peers relay instead of
+    /// punching at one of several addresses. This returns the per-egress
+    /// verdict instead, falling back to `udp_nat_type` whenever the sender did
+    /// not report one.
+    pub fn effective_udp_nat_type(&self, peer_supports_multi_egress: bool) -> NatType {
+        if peer_supports_multi_egress
+            && let Ok(nat_type) = NatType::try_from(self.multi_egress_udp_nat_type)
+            && nat_type != NatType::Unknown
+        {
+            return nat_type;
+        }
+        NatType::try_from(self.udp_nat_type).unwrap_or(NatType::Unknown)
+    }
+
+    /// Underlay egresses this host reported, or a single synthetic entry when it
+    /// reported none (single egress, or an older peer).
+    pub fn egress_endpoints_or_single(&self) -> Vec<EgressEndpoint> {
+        if self.egress_endpoints.is_empty() {
+            let Some(first) = self
+                .public_ip
+                .iter()
+                .find_map(|ip| ip.parse::<std::net::IpAddr>().ok())
+            else {
+                return Vec::new();
+            };
+            return vec![EgressEndpoint {
+                public_ip: first.to_string(),
+                min_port: self.min_port,
+                max_port: self.max_port,
+            }];
+        }
+        self.egress_endpoints.clone()
+    }
+}
+
 impl Flags {
     /// The flags the message declares, in declaration order, less the ones it
     /// has deprecated: what a user can still set.

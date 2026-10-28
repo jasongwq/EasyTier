@@ -212,6 +212,10 @@ message SelectPunchListenerResponse {
   common.SocketAddr listener_mapped_addr = 1;
   // Echoed only after source observation is registered; absent on older peers.
   optional uint32 transaction_id = 2;
+  // Every endpoint this listener is reachable at, one per underlay egress.
+  // Absent on older peers, and empty when the sender has a single egress, so
+  // readers fall back to `listener_mapped_addr`.
+  repeated common.SocketAddr endpoints = 3;
 }
 
 message SendPunchPacketConeRequest {
@@ -233,6 +237,12 @@ message SendPunchPacketHardSymRequest {
   uint32 transaction_id = 3;
   uint32 port_index = 4;
   uint32 round = 5;
+
+  // Endpoints to punch, one per underlay egress, each carrying its own port.
+  // A multi-WAN CPE can map different egresses to different ports, so the
+  // `public_ips` + shared-port form below cannot address them. When non-empty
+  // this replaces `public_ips`; older senders leave it empty.
+  repeated common.SocketAddr target_endpoints = 6;
 }
 
 message SendPunchPacketHardSymResponse { uint32 next_port_index = 1; }
@@ -245,6 +255,10 @@ message SendPunchPacketEasySymRequest {
   uint32 base_port_num = 4;
   uint32 max_port_num = 5;
   bool is_incremental = 6;
+
+  // Endpoints to punch, one per underlay egress, each carrying its own port.
+  // When non-empty this replaces `public_ips`; older senders leave it empty.
+  repeated common.SocketAddr target_endpoints = 7;
 }
 
 message SendPunchPacketBothEasySymRequest {
