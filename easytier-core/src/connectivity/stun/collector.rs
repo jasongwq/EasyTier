@@ -30,7 +30,7 @@ use crate::{
 use super::client::{
     HostResolverIter, StunDnsRuntime, StunNatTypeDetectResult, StunSocketRuntime,
     TcpNatTypeDetector, UdpNatTypeDetector, stun_udp_bind_options, tcp_bind_request,
-    udp_bind_request,
+    udp_bind_request, udp_bind_requests,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +69,21 @@ where
     S: VirtualUdpSocket,
 {
     async fn get_udp_port_mapping_with_socket(&self, socket: Arc<S>) -> anyhow::Result<SocketAddr>;
+
+    /// Every public address this socket is reachable at, one per underlay
+    /// egress.
+    ///
+    /// Behind a multi-WAN CPE the mapping depends on the destination, so a
+    /// single probe only reveals the egress that happened to carry it. Probing
+    /// several STUN servers makes the CPE select each egress in turn. Defaults
+    /// to the single mapping so hosts and test doubles without multi-egress
+    /// awareness keep working.
+    async fn get_udp_port_mappings_with_socket(
+        &self,
+        socket: Arc<S>,
+    ) -> anyhow::Result<Vec<SocketAddr>> {
+        Ok(vec![self.get_udp_port_mapping_with_socket(socket).await?])
+    }
 }
 
 pub struct StunInfoCollector<R, D: ?Sized>
@@ -261,7 +276,11 @@ where
                     .as_ref()
                     .map(StunNatTypeDetectResult::nat_type)
                     .unwrap_or(NatType::Unknown);
-                if nat_type == NatType::Symmetric {
+                let multi_egress = result
+                    .as_ref()
+                    .map(StunNatTypeDetectResult::is_multi_egress)
+                    .unwrap_or(false);
+                if nat_type == NatType::Symmetric && !multi_egress {
                     let old_result = result.as_mut().unwrap();
                     tracing::debug!(?old_result, "start get extra bind result");
                     for server in old_result.collect_available_stun_server() {
@@ -283,6 +302,13 @@ where
                         && (nat_type != NatType::Symmetric || completed_extra_test)
                     {
                         sleep_sec = 600;
+                    }
+                    // A multi-WAN CPE rehashes flows when a WAN flaps, and the
+                    // address we advertise then points at an egress that no
+                    // longer carries our traffic. Re-probe often enough to
+                    // notice within a minute rather than ten.
+                    if multi_egress {
+                        sleep_sec = sleep_sec.min(60);
                     }
                 }
 
@@ -389,11 +415,34 @@ where
             public_ip.insert(ip.to_string());
         }
 
+        let egress_groups = udp_result
+            .as_ref()
+            .map(|result| result.egress_groups())
+            .unwrap_or_default();
+        let egress_count = egress_groups.len();
+        let multi_egress = egress_count > 1;
+
+        // Keep `udp_nat_type` conservative for peers that cannot consume the
+        // per-egress verdict: a host whose public address depends on the
+        // destination is indistinguishable from a symmetric NAT to them, and
+        // telling them "cone" would make them punch at one of several
+        // addresses and half-succeed, which is worse than relaying.
+        //
+        // That only applies when *no* egress is punchable. Once one is, every
+        // peer — old or new — is told a single address it can actually reach,
+        // so reporting cone is accurate rather than optimistic.
+        let udp_nat_type = udp_result
+            .as_ref()
+            .map(|result| result.nat_type())
+            .unwrap_or(NatType::Unknown);
+        let multi_egress_udp_nat_type = if multi_egress {
+            udp_nat_type
+        } else {
+            NatType::Unknown
+        };
+
         StunInfo {
-            udp_nat_type: udp_result
-                .as_ref()
-                .map(|result| result.nat_type() as i32)
-                .unwrap_or(NatType::Unknown as i32),
+            udp_nat_type: udp_nat_type as i32,
             tcp_nat_type: tcp_result
                 .as_ref()
                 .map(|result| result.nat_type() as i32)
@@ -410,6 +459,22 @@ where
                 .map(|result| result.max_port() as u32)
                 .or_else(|| tcp_result.as_ref().map(|result| result.max_port() as u32))
                 .unwrap_or(0),
+            egress_count: egress_count as u32,
+            // Advertise every observed egress, including the ones whose port
+            // depends on the destination. Peers try each address in turn and
+            // keep whichever answers, so an unpredictable egress still helps
+            // when the CPE happens to pick the port we named. Filtering here
+            // would throw away that chance for the sake of tidiness.
+            egress_endpoints: egress_groups
+                .iter()
+                .map(|group| crate::proto::common::EgressEndpoint {
+                    public_ip: group.public_ip.to_string(),
+                    min_port: group.min_port().unwrap_or(0) as u32,
+                    max_port: group.max_port().unwrap_or(0) as u32,
+                })
+                .collect(),
+            multi_egress_udp_nat_type: multi_egress_udp_nat_type as i32,
+            egress_mapping_stable: udp_result.as_ref().and_then(|result| result.repeatable),
         }
     }
 
@@ -487,6 +552,17 @@ where
         &self,
         socket: Arc<<R as VirtualUdpSocketFactory>::Socket>,
     ) -> anyhow::Result<SocketAddr> {
+        let mappings = self.get_udp_port_mappings_with_socket(socket).await?;
+        mappings
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no UDP STUN mapping found"))
+    }
+
+    async fn get_udp_port_mappings_with_socket(
+        &self,
+        socket: Arc<<R as VirtualUdpSocketFactory>::Socket>,
+    ) -> anyhow::Result<Vec<SocketAddr>> {
         self.start_stun_routine();
         let mut servers = self
             .udp_nat_test_result
@@ -513,18 +589,76 @@ where
             }
         }
 
-        for server in servers {
-            match udp_bind_request(socket.clone(), server).await {
-                Ok(response) => {
-                    if let Some(mapped_addr) = response.mapped_socket_addr {
-                        return Ok(mapped_addr);
-                    }
+        // Each distinct STUN server is a distinct destination, so a CPE that
+        // selects an egress per destination maps this socket to a different
+        // public address for each one. Collect them all; the caller decides
+        // whether one address or several is useful.
+        //
+        // Probe them concurrently. This runs on the hole-punch listener
+        // creation path, which sits behind the signaling RPC's 4s timeout, and
+        // a host behind a multi-WAN CPE gets several servers back from the
+        // earlier NAT probe. Waiting on them one at a time makes listener
+        // creation slow enough that the peer gives up before we ever answer.
+        //
+        // The probes share one socket *and* one receive loop; giving each its
+        // own would make them steal each other's datagrams.
+        let mut mappings = Vec::new();
+        for (server, result) in udp_bind_requests(socket, servers).await {
+            let mapped_addr = match result {
+                Ok(response) => response.mapped_socket_addr,
+                Err(error) => {
+                    tracing::warn!(?server, ?error, "stun bind request failed");
+                    None
                 }
-                Err(error) => tracing::warn!(?server, ?error, "stun bind request failed"),
+            };
+            if let Some(mapped_addr) = mapped_addr {
+                if !mappings.contains(&mapped_addr) {
+                    mappings.push(mapped_addr);
+                }
             }
         }
-        anyhow::bail!("no UDP STUN mapping found")
+
+        // Callers treat the first entry as *the* address to advertise, and
+        // peers that predate per-egress endpoints can only use that one. The
+        // probes above finish in arbitrary order, so without this sort the
+        // primary address would be whichever egress happened to answer first —
+        // sometimes a per-destination egress, whose port the peer then punches
+        // at and never reaches. Prefer the egresses we know keep a stable port.
+        let stable_egress_ips: BTreeSet<IpAddr> = self
+            .udp_nat_test_result
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|result| {
+                result
+                    .egress_groups()
+                    .into_iter()
+                    .filter(|group| group.punch_port().is_some())
+                    .map(|group| group.public_ip)
+                    .collect()
+            })
+            .unwrap_or_default();
+        prefer_stable_egress(&mut mappings, &stable_egress_ips);
+
+        if mappings.is_empty() {
+            anyhow::bail!("no UDP STUN mapping found");
+        }
+        Ok(mappings)
     }
+}
+
+/// Moves mappings whose egress keeps a stable port to the front.
+///
+/// The first entry is what callers advertise as the primary address, and peers
+/// that predate per-egress endpoints can only use that one. Probing finishes in
+/// arbitrary order, so without this the primary address would be whichever
+/// egress answered first — sometimes a per-destination egress, whose port the
+/// peer then punches at and never reaches.
+fn prefer_stable_egress(mappings: &mut [SocketAddr], stable_egress_ips: &BTreeSet<IpAddr>) {
+    if stable_egress_ips.is_empty() {
+        return;
+    }
+    mappings.sort_by_key(|addr| !stable_egress_ips.contains(&addr.ip()));
 }
 
 fn sampled_servers(servers: &[String]) -> Vec<String> {
@@ -736,7 +870,46 @@ mod tests {
         assert_eq!(collector.tcp_socket_context, tcp_context);
     }
 
-    #[tokio::test]
+    #[test]
+    fn stable_egress_becomes_the_primary_address() {
+        // Probe order is arbitrary after the concurrent rewrite. The address a
+        // peer is told to punch at must be the one whose port does not move.
+        let per_destination: SocketAddr = "122.224.109.114:30651".parse().unwrap();
+        let stable: SocketAddr = "60.12.249.167:22138".parse().unwrap();
+        let mut mappings = vec![per_destination, stable];
+        let stable_ips = BTreeSet::from([stable.ip()]);
+
+        prefer_stable_egress(&mut mappings, &stable_ips);
+
+        assert_eq!(mappings[0], stable);
+        assert_eq!(mappings[1], per_destination);
+    }
+
+    #[test]
+    fn unknown_egress_set_leaves_probe_order_alone() {
+        // Without a completed NAT probe there is nothing to rank by, so the
+        // caller keeps whatever the probes returned.
+        let first: SocketAddr = "203.0.113.1:5000".parse().unwrap();
+        let second: SocketAddr = "198.51.100.1:6001".parse().unwrap();
+        let mut mappings = vec![first, second];
+
+        prefer_stable_egress(&mut mappings, &BTreeSet::new());
+
+        assert_eq!(mappings, vec![first, second]);
+    }
+
+    #[test]
+    fn all_stable_egresses_keep_their_relative_order() {
+        let a: SocketAddr = "203.0.113.1:5000".parse().unwrap();
+        let b: SocketAddr = "198.51.100.1:6001".parse().unwrap();
+        let mut mappings = vec![a, b];
+        let stable_ips = BTreeSet::from([a.ip(), b.ip()]);
+
+        prefer_stable_egress(&mut mappings, &stable_ips);
+
+        assert_eq!(mappings, vec![a, b]);
+    }
+
     async fn udp_mapping_uses_portable_runtime_and_instance_context() {
         let runtime = Arc::new(MockRuntime::default());
         let context = SocketContext::default()

@@ -1,7 +1,7 @@
 //! Portable STUN clients and NAT classification.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
     time::Duration,
@@ -398,6 +398,61 @@ pub struct StunNatTypeDetectResult {
     source_addr: SocketAddr,
     pub(super) stun_resps: Vec<BindRequestResponse>,
     pub(super) extra_bind_test: Option<BindRequestResponse>,
+    /// Whether repeating a probe to the same STUN server returned the same
+    /// mapped address. `None` when no repeat probe completed.
+    ///
+    /// A multi-WAN CPE that hashes each flow once keeps this stable; one that
+    /// spreads packets of a single flow across WANs does not, and no amount of
+    /// port prediction can punch through it.
+    pub(super) repeatable: Option<bool>,
+}
+
+/// One distinct underlay egress, identified by the public IP the CPE maps this
+/// socket to when it picks that egress.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressGroup {
+    pub public_ip: IpAddr,
+    ports: BTreeSet<u16>,
+    stun_servers: BTreeSet<SocketAddr>,
+}
+
+impl EgressGroup {
+    pub fn min_port(&self) -> Option<u16> {
+        self.ports.iter().next().copied()
+    }
+
+    pub fn max_port(&self) -> Option<u16> {
+        self.ports.iter().next_back().copied()
+    }
+
+    pub fn port_count(&self) -> usize {
+        self.ports.len()
+    }
+
+    /// Endpoint-independent mapping on this egress: every destination probed
+    /// through it saw the same public port.
+    ///
+    /// A single destination proves nothing about mapping independence, so one
+    /// server is only trusted when a repeat probe showed the same flow is
+    /// mapped stably — that rules out per-packet egress selection, which is the
+    /// only way a stable single port could still be a mirage.
+    fn is_cone(&self, flow_is_stable: bool) -> bool {
+        self.ports.len() == 1 && (self.stun_servers.len() >= 2 || flow_is_stable)
+    }
+
+    /// The port to advertise for this egress, or `None` when no peer could
+    /// usefully punch at it.
+    ///
+    /// A per-destination egress has no single port to name, and advertising
+    /// the lowest one would send peers to a port the CPE only opens for
+    /// *someone else's* destination. Such an egress is simply not offered.
+    pub fn punch_port(&self) -> Option<u16> {
+        if self.ports.len() == 1 {
+            self.ports.iter().next().copied()
+        } else {
+            None
+        }
+    }
 }
 
 impl StunNatTypeDetectResult {
@@ -411,14 +466,40 @@ impl StunNatTypeDetectResult {
             source_addr,
             stun_resps,
             extra_bind_test: None,
+            repeatable: None,
         }
     }
 
-    fn has_ip_changed_resp(&self) -> bool {
+    /// Responses grouped by the public IP they were mapped to, one group per
+    /// underlay egress. A single-egress host yields exactly one group.
+    pub fn egress_groups(&self) -> Vec<EgressGroup> {
+        let mut groups: BTreeMap<IpAddr, EgressGroup> = BTreeMap::new();
+        for resp in &self.stun_resps {
+            let Some(mapped) = resp.mapped_socket_addr else {
+                continue;
+            };
+            let group = groups.entry(mapped.ip()).or_insert_with(|| EgressGroup {
+                public_ip: mapped.ip(),
+                ports: BTreeSet::new(),
+                stun_servers: BTreeSet::new(),
+            });
+            group.ports.insert(mapped.port());
+            group.stun_servers.insert(resp.stun_server_addr);
+        }
+        groups.into_values().collect()
+    }
+
+    /// True when more than one underlay egress was observed, i.e. the host sits
+    /// behind a multi-WAN CPE that selects an egress per destination.
+    pub fn is_multi_egress(&self) -> bool {
+        self.egress_groups().len() > 1
+    }
+
+    pub fn has_ip_changed_resp(&self) -> bool {
         self.stun_resps.iter().any(|resp| resp.real_ip_changed)
     }
 
-    fn has_port_changed_resp(&self) -> bool {
+    pub fn has_port_changed_resp(&self) -> bool {
         self.stun_resps.iter().any(|resp| resp.real_port_changed)
     }
 
@@ -442,6 +523,7 @@ impl StunNatTypeDetectResult {
             .len()
     }
 
+    /// Every destination we probed saw the same single mapping.
     fn is_cone(&self) -> bool {
         self.stun_resps
             .iter()
@@ -454,6 +536,18 @@ impl StunNatTypeDetectResult {
     fn nat_type_udp(&self) -> NatType {
         if self.stun_server_count() < 2 {
             return NatType::Unknown;
+        }
+
+        // A CPE that spreads one flow's packets over several WANs breaks the
+        // port prediction every symmetric-NAT strategy relies on. Nothing can
+        // punch through it, so say so instead of letting the grouping below
+        // mistake the resulting port spread for a per-destination mapping.
+        if self.repeatable == Some(false) {
+            return NatType::Symmetric;
+        }
+
+        if self.is_multi_egress() {
+            return self.nat_type_multi_egress_udp();
         }
 
         if self.is_cone() {
@@ -471,10 +565,7 @@ impl StunNatTypeDetectResult {
                 NatType::PortRestricted
             }
         } else if !self.stun_resps.is_empty() {
-            if self.public_ips().len() != 1
-                || self.usable_stun_resp_count() <= 1
-                || self.max_port() - self.min_port() > 15
-            {
+            if self.usable_stun_resp_count() <= 1 || self.max_port() - self.min_port() > 15 {
                 NatType::Symmetric
             } else if let Some(extra_bind_mapped) = self
                 .extra_bind_test
@@ -499,12 +590,43 @@ impl StunNatTypeDetectResult {
         }
     }
 
+    /// A per-destination egress selection makes the public IP vary with the
+    /// destination, which the single-egress logic reads as a symmetric NAT.
+    /// Judge each egress on its own instead: as long as one maps
+    /// endpoint-independently, a peer has an address that reaches us, so the
+    /// host is as punchable as any cone.
+    fn nat_type_multi_egress_udp(&self) -> NatType {
+        let flow_is_stable = self.repeatable == Some(true);
+        let groups = self.egress_groups();
+        // One predictable egress is enough to be reachable: a peer punches at
+        // that address and the CPE routes it out the WAN that owns it. The
+        // unpredictable egresses are still advertised — the peer tries every
+        // address and keeps whichever answers — but they must not veto the
+        // node, which would relay traffic that could have gone direct.
+        if !groups.iter().any(|group| group.is_cone(flow_is_stable)) {
+            return NatType::Symmetric;
+        }
+
+        if self.is_open_internet() {
+            NatType::OpenInternet
+        } else if self.is_no_pat() {
+            NatType::NoPat
+        } else if self.has_port_changed_resp() {
+            NatType::Restricted
+        } else {
+            NatType::PortRestricted
+        }
+    }
+
     fn nat_type_tcp(&self) -> NatType {
         if self.is_open_internet() {
             return NatType::OpenInternet;
         }
         if self.stun_server_count() < 2 || self.stun_resps.is_empty() {
             return NatType::Unknown;
+        }
+        if self.repeatable == Some(false) {
+            return NatType::Symmetric;
         }
         if self.is_cone() {
             if self.is_no_pat() {
@@ -549,6 +671,13 @@ impl StunNatTypeDetectResult {
 
     pub fn extend_result(&mut self, other: Self) {
         self.stun_resps.extend(other.stun_resps);
+        // A flow that proved stable in either probe is stable; only report
+        // instability when a probe actually observed it.
+        self.repeatable = match (self.repeatable, other.repeatable) {
+            (Some(false), _) | (_, Some(false)) => Some(false),
+            (Some(true), _) | (_, Some(true)) => Some(true),
+            _ => None,
+        };
     }
 
     pub fn min_port(&self) -> u16 {
@@ -678,11 +807,61 @@ where
                 responses.push(response);
             }
         }
-        Ok(StunNatTypeDetectResult::new(
-            StunTransport::Udp,
-            socket.local_addr()?,
-            responses,
-        ))
+
+        let mut result =
+            StunNatTypeDetectResult::new(StunTransport::Udp, socket.local_addr()?, responses);
+        result.repeatable =
+            Self::probe_repeatability(&client_builder, &result.collect_available_stun_server())
+                .await;
+        Ok(result)
+    }
+
+    /// Re-probe the same STUN server from the same socket and check that every
+    /// attempt is mapped to the same public address.
+    ///
+    /// This separates the two multi-WAN behaviours that a single probe cannot
+    /// tell apart. A CPE that picks an egress per flow keeps the mapping
+    /// stable, so port prediction still works. One that spreads packets of a
+    /// single flow across WANs does not, and every symmetric-NAT strategy will
+    /// punch at addresses the peer never sees. Returns `None` when no server
+    /// answered all attempts.
+    async fn probe_repeatability(
+        builder: &StunClientBuilder<<R as VirtualUdpSocketFactory>::Socket>,
+        servers: &[SocketAddr],
+    ) -> Option<bool> {
+        const ATTEMPTS: usize = 3;
+
+        let mut conclusive = false;
+        for server in servers.iter().take(2) {
+            let mut mapped = Vec::with_capacity(ATTEMPTS);
+            for _ in 0..ATTEMPTS {
+                match builder
+                    .new_stun_client(*server)
+                    .bind_request(false, false)
+                    .await
+                {
+                    Ok(response) => mapped.push(response.mapped_socket_addr),
+                    // A dropped probe says nothing about stability.
+                    Err(_) => break,
+                }
+                crate::foundation::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            if mapped.len() < ATTEMPTS {
+                continue;
+            }
+            if mapped.windows(2).any(|pair| pair[0] != pair[1]) {
+                tracing::debug!(
+                    ?server,
+                    ?mapped,
+                    "repeated STUN probes disagree, egress is chosen per packet"
+                );
+                return Some(false);
+            }
+            conclusive = true;
+        }
+
+        conclusive.then_some(true)
     }
 }
 
@@ -700,6 +879,35 @@ where
         .await;
     clients.stop().await;
     result
+}
+
+/// Probes several STUN servers at once over one socket.
+///
+/// Each probe must not build its own `StunClientBuilder`: every builder spawns
+/// its own `recv_from` loop on the socket, and the kernel delivers each UDP
+/// datagram to exactly one of those loops. Concurrent builders therefore steal
+/// each other's responses, and the losers report no mapping at all — which is
+/// worse than not probing, because the caller cannot tell a failed probe from a
+/// host with a single egress. One builder feeds a broadcast channel, so every
+/// client sees every datagram and matches it against its own transaction ids.
+pub(super) async fn udp_bind_requests<S>(
+    socket: Arc<S>,
+    stun_servers: Vec<SocketAddr>,
+) -> Vec<(SocketAddr, anyhow::Result<BindRequestResponse>)>
+where
+    S: VirtualUdpSocket,
+{
+    let mut builder = StunClientBuilder::new(socket);
+    let requests = stun_servers.into_iter().map(|stun_server| {
+        let client = builder.new_stun_client(stun_server);
+        async move {
+            let result = client.bind_request(false, false).await;
+            (stun_server, result)
+        }
+    });
+    let results = futures::future::join_all(requests).await;
+    builder.stop().await;
+    results
 }
 
 pub(super) fn stun_udp_bind_options(
@@ -949,6 +1157,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use async_trait::async_trait;
 
     use crate::host::dns::{DnsQuery, DnsRecordResolver, DnsResolver, DnsSrvRecord};
@@ -972,6 +1182,122 @@ mod tests {
 
         async fn resolve_srv(&self, _query: DnsQuery) -> anyhow::Result<Vec<DnsSrvRecord>> {
             Ok(Vec::new())
+        }
+    }
+
+    /// One socket, several destinations, a CPE that maps each destination to a
+    /// different public address: every probe must come back with its own
+    /// mapping. Building a client per probe instead makes them race for the
+    /// single receive loop, and the losers report no mapping at all.
+    #[tokio::test]
+    async fn concurrent_probes_on_one_socket_do_not_steal_each_others_responses() {
+        let socket = Arc::new(PerDestinationStunSocket::new(vec![
+            (
+                "192.0.2.1:3478".parse().unwrap(),
+                "60.12.249.167:9527".parse().unwrap(),
+            ),
+            (
+                "192.0.2.2:3478".parse().unwrap(),
+                "122.224.109.114:47699".parse().unwrap(),
+            ),
+            (
+                "192.0.2.3:3478".parse().unwrap(),
+                "122.224.109.114:6374".parse().unwrap(),
+            ),
+        ]));
+
+        let results = udp_bind_requests(
+            socket,
+            vec![
+                "192.0.2.1:3478".parse().unwrap(),
+                "192.0.2.2:3478".parse().unwrap(),
+                "192.0.2.3:3478".parse().unwrap(),
+            ],
+        )
+        .await;
+
+        let mut mappings: Vec<SocketAddr> = results
+            .into_iter()
+            .map(|(server, result)| {
+                let response = result.unwrap_or_else(|error| panic!("{server} failed: {error}"));
+                response
+                    .mapped_socket_addr
+                    .unwrap_or_else(|| panic!("{server} reported no mapping"))
+            })
+            .collect();
+        mappings.sort();
+
+        assert_eq!(
+            mappings,
+            vec![
+                "60.12.249.167:9527".parse::<SocketAddr>().unwrap(),
+                "122.224.109.114:6374".parse().unwrap(),
+                "122.224.109.114:47699".parse().unwrap(),
+            ]
+        );
+    }
+
+    /// Maps each STUN server to its own public address, like a multi-WAN CPE
+    /// that picks an egress per destination.
+    struct PerDestinationStunSocket {
+        local_addr: SocketAddr,
+        mappings: Vec<(SocketAddr, SocketAddr)>,
+        pending: Mutex<VecDeque<(Vec<u8>, SocketAddr)>>,
+        ready: tokio::sync::Notify,
+    }
+
+    impl PerDestinationStunSocket {
+        fn new(mappings: Vec<(SocketAddr, SocketAddr)>) -> Self {
+            Self {
+                local_addr: "0.0.0.0:40000".parse().unwrap(),
+                mappings,
+                pending: Mutex::new(VecDeque::new()),
+                ready: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl VirtualUdpSocket for PerDestinationStunSocket {
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            Ok(self.local_addr)
+        }
+
+        async fn send_to(&self, data: &[u8], addr: SocketAddr) -> std::io::Result<usize> {
+            let request = MessageDecoder::<Attribute>::new()
+                .decode_from_bytes(data)
+                .map_err(|error| std::io::Error::other(format!("{error:?}")))?
+                .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+            let mapped = self
+                .mappings
+                .iter()
+                .find(|(server, _)| *server == addr)
+                .map(|(_, mapped)| *mapped)
+                .ok_or_else(|| std::io::Error::other(format!("unexpected stun server {addr}")))?;
+            let mut response = Message::<Attribute>::new(
+                MessageClass::SuccessResponse,
+                BINDING,
+                request.transaction_id(),
+            );
+            response.add_attribute(Attribute::XorMappedAddress(
+                stun_codec::rfc5389::attributes::XorMappedAddress::new(mapped),
+            ));
+            let bytes = MessageEncoder::new()
+                .encode_into_bytes(response)
+                .map_err(std::io::Error::other)?;
+            self.pending.lock().await.push_back((bytes, addr));
+            self.ready.notify_one();
+            Ok(data.len())
+        }
+
+        async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            loop {
+                if let Some((bytes, addr)) = self.pending.lock().await.pop_front() {
+                    buf[..bytes.len()].copy_from_slice(&bytes);
+                    return Ok((bytes.len(), addr));
+                }
+                self.ready.notified().await;
+            }
         }
     }
 
@@ -1030,5 +1356,197 @@ mod tests {
             options.purpose,
             crate::socket::udp::UdpSocketPurpose::StunProbe
         );
+    }
+
+    fn response(stun_server: &str, mapped: Option<&str>) -> BindRequestResponse {
+        let stun_server: SocketAddr = stun_server.parse().unwrap();
+        BindRequestResponse {
+            local_addr: "192.168.1.10:5000".parse().unwrap(),
+            stun_server_addr: stun_server,
+            recv_from_addr: stun_server,
+            mapped_socket_addr: mapped.map(|addr| addr.parse().unwrap()),
+            changed_socket_addr: None,
+            change_ip: false,
+            change_port: false,
+            real_ip_changed: false,
+            real_port_changed: false,
+            latency_us: 0,
+        }
+    }
+
+    fn udp_result(responses: Vec<BindRequestResponse>) -> StunNatTypeDetectResult {
+        StunNatTypeDetectResult::new(
+            StunTransport::Udp,
+            "192.168.1.10:5000".parse().unwrap(),
+            responses,
+        )
+    }
+
+    #[test]
+    fn single_egress_cone_classification_is_unchanged() {
+        let result = udp_result(vec![
+            response("1.1.1.1:3478", Some("203.0.113.1:5000")),
+            response("2.2.2.2:3478", Some("203.0.113.1:5000")),
+        ]);
+
+        assert_eq!(result.nat_type(), NatType::PortRestricted);
+        assert!(!result.is_multi_egress());
+        assert_eq!(result.egress_groups().len(), 1);
+    }
+
+    #[test]
+    fn per_destination_egress_selection_is_not_symmetric() {
+        // A policy-routing CPE picks a WAN per destination, so each STUN server
+        // sees a different public IP while each egress maps this socket to a
+        // single port. That is punchable, and the old single-egress logic
+        // mistook the IP spread for a symmetric NAT.
+        //
+        // Each egress here was only reached by one server, which on its own
+        // cannot separate a cone from a symmetric NAT. The repeat probe is what
+        // supplies the missing evidence: the same flow keeps its mapping, so
+        // the egress is not rehashing per packet.
+        let mut result = udp_result(vec![
+            response("1.1.1.1:3478", Some("203.0.113.1:6000")),
+            response("2.2.2.2:3478", Some("198.51.100.1:6001")),
+        ]);
+        result.repeatable = Some(true);
+
+        assert!(result.is_multi_egress());
+        assert_eq!(result.nat_type(), NatType::PortRestricted);
+    }
+
+    #[test]
+    fn multi_egress_without_stability_evidence_stays_conservative() {
+        // Same observation as above but no repeat probe completed. One server
+        // per egress cannot prove endpoint-independent mapping, and guessing
+        // wrong means punching at a port the peer's NAT drops. Relay instead.
+        let result = udp_result(vec![
+            response("1.1.1.1:3478", Some("203.0.113.1:5000")),
+            response("2.2.2.2:3478", Some("198.51.100.1:5001")),
+        ]);
+
+        assert!(result.is_multi_egress());
+        assert_eq!(result.nat_type(), NatType::Symmetric);
+    }
+
+    #[test]
+    fn multi_egress_confirmed_by_two_servers_needs_no_repeat_probe() {
+        // When an egress is reached through two destinations and both map to
+        // the same port, that is endpoint-independent mapping on its own.
+        let result = udp_result(vec![
+            response("1.1.1.1:3478", Some("203.0.113.1:6000")),
+            response("2.2.2.2:3478", Some("203.0.113.1:6000")),
+            response("3.3.3.3:3478", Some("198.51.100.1:6001")),
+            response("4.4.4.4:3478", Some("198.51.100.1:6001")),
+        ]);
+
+        assert!(result.is_multi_egress());
+        assert_eq!(result.nat_type(), NatType::PortRestricted);
+    }
+
+    #[test]
+    fn one_predictable_egress_is_enough_even_if_another_is_not() {
+        // Real dual-WAN CPE: WAN1 keeps one port, WAN2 rehashes per destination.
+        // A peer can still reach WAN1's address, so the node is punchable. The
+        // unpredictable WAN must not veto the node.
+        let mut result = udp_result(vec![
+            response("1.1.1.1:3478", Some("203.0.113.1:7000")),
+            response("2.2.2.2:3478", Some("203.0.113.1:8000")),
+            response("3.3.3.3:3478", Some("198.51.100.1:7001")),
+        ]);
+        // WAN2 was reached by one server only; the repeat probe is what lets a
+        // single-server egress count as predictable.
+        result.repeatable = Some(true);
+
+        assert!(result.is_multi_egress());
+        assert_eq!(result.nat_type(), NatType::PortRestricted);
+
+        // Both egresses are still offered to peers: the unpredictable one may
+        // answer if the CPE happens to pick the port we named.
+        let groups = result.egress_groups();
+        assert_eq!(groups.len(), 2);
+        assert!(groups.iter().any(|group| group.punch_port() == Some(7001)));
+        assert!(
+            groups
+                .iter()
+                .any(|group| group.punch_port().is_none() && group.port_count() > 1)
+        );
+    }
+
+    #[test]
+    fn all_egresses_unpredictable_is_symmetric() {
+        // Nothing survives the filter, so no address can be advertised.
+        let result = udp_result(vec![
+            response("1.1.1.1:3478", Some("203.0.113.1:5000")),
+            response("2.2.2.2:3478", Some("203.0.113.1:6000")),
+            response("3.3.3.3:3478", Some("198.51.100.1:5001")),
+            response("4.4.4.4:3478", Some("198.51.100.1:6002")),
+        ]);
+
+        assert!(result.is_multi_egress());
+        assert_eq!(result.nat_type(), NatType::Symmetric);
+        assert!(
+            result
+                .egress_groups()
+                .iter()
+                .all(|group| group.punch_port().is_none())
+        );
+    }
+
+    #[test]
+    fn unstable_flow_is_symmetric_regardless_of_grouping() {
+        // A CPE that spreads one flow's packets over WANs produces a stable
+        // per-egress port only by accident; no port prediction can hit it.
+        let mut result = udp_result(vec![
+            response("1.1.1.1:3478", Some("203.0.113.1:5000")),
+            response("2.2.2.2:3478", Some("198.51.100.1:5001")),
+        ]);
+        result.repeatable = Some(false);
+
+        assert!(result.is_multi_egress());
+        assert_eq!(result.nat_type(), NatType::Symmetric);
+    }
+
+    #[test]
+    fn unstable_flow_overrides_an_apparently_conic_single_egress() {
+        let mut result = udp_result(vec![
+            response("1.1.1.1:3478", Some("203.0.113.1:5000")),
+            response("2.2.2.2:3478", Some("203.0.113.1:5000")),
+        ]);
+        result.repeatable = Some(false);
+
+        assert_eq!(result.nat_type(), NatType::Symmetric);
+    }
+
+    #[test]
+    fn egress_groups_carry_per_egress_port_range() {
+        let result = udp_result(vec![
+            response("1.1.1.1:3478", Some("203.0.113.1:5000")),
+            response("2.2.2.2:3478", Some("198.51.100.1:6001")),
+            response("3.3.3.3:3478", Some("198.51.100.1:6002")),
+        ]);
+
+        let groups = result.egress_groups();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups[0].public_ip,
+            "198.51.100.1".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(groups[0].min_port(), Some(6001));
+        assert_eq!(groups[0].max_port(), Some(6002));
+        assert_eq!(groups[1].min_port(), Some(5000));
+    }
+
+    #[test]
+    fn extend_result_keeps_an_observed_instability() {
+        let mut stable = udp_result(vec![response("1.1.1.1:3478", Some("203.0.113.1:5000"))]);
+        stable.repeatable = Some(true);
+        let mut unstable = udp_result(vec![response("2.2.2.2:3478", Some("203.0.113.1:5001"))]);
+        unstable.repeatable = Some(false);
+
+        stable.extend_result(unstable);
+
+        assert_eq!(stable.repeatable, Some(false));
+        assert_eq!(stable.nat_type(), NatType::Symmetric);
     }
 }
