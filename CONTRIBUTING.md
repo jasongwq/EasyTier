@@ -113,6 +113,21 @@ cargo build --release --target x86_64-pc-windows-msvc        # Windows x86_64
 
 Build artifacts: `target/[target-triple]/release/`
 
+### Faster Local Builds and Cross-Compiling for Windows
+
+`[profile.release]` uses fat LTO with `codegen-units = 1`, which is slow. For
+day-to-day edit/run cycles use the `fast` profile:
+
+```bash
+cargo build --profile fast --target x86_64-pc-windows-gnu \
+  --package=easytier --features=mimalloc
+```
+
+For the full set of environment variables for cross-compiling Windows binaries
+from Linux, measured timings, and how to diagnose a build that hangs because
+`clang` was replaced by a self-recursive wrapper, see
+[docs/local-windows-cross-build.md](docs/local-windows-cross-build.md).
+
 ### Building the WASI core
 
 ```bash

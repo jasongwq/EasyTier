@@ -121,6 +121,20 @@ cargo build --release --target x86_64-pc-windows-msvc        # Windows x86_64
 
 构建产物位置：`target/[target-triple]/release/`
 
+### 本地开发提速与 Linux 交叉编译 Windows
+
+`[profile.release]` 使用 fat LTO + `codegen-units = 1`，全量编译较慢。日常
+改代码联调请用新增的 `fast` profile：
+
+```bash
+cargo build --profile fast --target x86_64-pc-windows-gnu \
+  --package=easytier --features=mimalloc
+```
+
+在 Linux 上交叉编译 Windows 产物的完整环境变量、实测耗时、clang 被篡改
+导致构建卡死的排查方法，见
+[docs/local-windows-cross-build.md](docs/local-windows-cross-build.md)。
+
 ### 构建桌面应用
 
 ```bash

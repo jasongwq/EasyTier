@@ -117,3 +117,12 @@ strip = true
 inherits = "release"
 opt-level = "z"
 strip = "symbols"
+
+# 日常开发/联调用的中间档：编译快，运行性能够用。
+# 用法：cargo build --profile fast
+[profile.fast]
+inherits = "dev"
+opt-level = 1
+debug = 0
+strip = "symbols"
+incremental = true
