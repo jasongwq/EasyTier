@@ -451,11 +451,22 @@ impl PeerConn {
         match self.origin {
             // TCP hole-punched connections need frequent traffic to stay alive.
             PeerConnectionOrigin::TcpHolePunch => Duration::from_secs(1),
-            PeerConnectionOrigin::Manual
-            | PeerConnectionOrigin::Direct
-            | PeerConnectionOrigin::Listener
-            | PeerConnectionOrigin::UdpHolePunch
-            | PeerConnectionOrigin::Attached => Duration::from_secs(32),
+            // A hole-punched UDP path exists only as long as the NAT keeps the
+            // mapping open, and a multi-WAN CPE expires idle sessions sooner
+            // than the 32s the other origins can afford. The backoff still
+            // starts at 1s and doubles, but it caps here so the mapping never
+            // goes quiet long enough to be reclaimed.
+            PeerConnectionOrigin::UdpHolePunch => Duration::from_secs(5),
+            // Same NAT expiry, different transport. A connection this node
+            // dialed out (Listener) or a plain direct link can sit behind the
+            // same CPE, whose idle timeout is shorter than 32s; the session is
+            // then reclaimed between two heartbeats and the link flaps. These
+            // sockets carry no TCP keepalive either, so the ping is the only
+            // thing holding the mapping open.
+            PeerConnectionOrigin::Listener | PeerConnectionOrigin::Direct => Duration::from_secs(5),
+            PeerConnectionOrigin::Manual | PeerConnectionOrigin::Attached => {
+                Duration::from_secs(32)
+            }
         }
     }
 
@@ -1316,14 +1327,23 @@ impl PeerConn {
             async move {
                 tracing::info!("start recving peer conn packet");
                 let mut task_ret = Ok(());
-                while let Some(ret) = stream.next().await {
+                let mut rx_packets: u64 = 0;
+                // Why this loop stopped decides whether the connection is torn
+                // down: every exit path below ends in notify_close(). Logging
+                // the reason is the only way to tell a transport that really
+                // died from one that was merely handed a closed queue.
+                let exit_reason = loop {
+                    let Some(ret) = stream.next().await else {
+                        break "stream ended";
+                    };
                     if ret.is_err() {
                         tracing::error!(error = ?ret, "peer conn recv error");
                         task_ret = Err(ret.err().unwrap());
-                        break;
+                        break "stream error";
                     }
 
                     let mut zc_packet = ret.unwrap();
+                    rx_packets += 1;
                     let buf_len = zc_packet.buf_len() as u64;
                     if let Some(payload_len) = data_packet_payload_len(&zc_packet)
                         && let Some(limiter) = recv_limiter.as_ref()
@@ -1336,7 +1356,7 @@ impl PeerConn {
                             "unexpected packet: {:?}, cannot decode peer manager hdr",
                             zc_packet
                         );
-                        break;
+                        break "undecodable peer manager header";
                     };
 
                     if peer_mgr_hdr.packet_type == PacketType::Ping as u8 {
@@ -1356,11 +1376,17 @@ impl PeerConn {
                         .await
                         .is_err()
                     {
-                        break;
+                        break "packet recv channel closed";
                     }
-                }
+                };
 
-                tracing::info!("end recving peer conn packet");
+                tracing::warn!(
+                    exit_reason,
+                    rx_packets,
+                    already_closed = close_event_notifier.is_closed(),
+                    ?task_ret,
+                    "end recving peer conn packet"
+                );
 
                 drop(sink);
                 close_event_notifier.notify_close();
@@ -1559,10 +1585,10 @@ mod tests {
     async fn connection_origin_determines_hole_punch_and_ping_policy() {
         for (origin, is_hole_punched, max_interval) in [
             (PeerConnectionOrigin::Manual, false, 32),
-            (PeerConnectionOrigin::Direct, false, 32),
-            (PeerConnectionOrigin::Listener, false, 32),
+            (PeerConnectionOrigin::Direct, false, 5),
+            (PeerConnectionOrigin::Listener, false, 5),
             (PeerConnectionOrigin::TcpHolePunch, true, 1),
-            (PeerConnectionOrigin::UdpHolePunch, true, 32),
+            (PeerConnectionOrigin::UdpHolePunch, true, 5),
             (PeerConnectionOrigin::Attached, false, 32),
         ] {
             // Admission determines the policy even when the transport is a ring.

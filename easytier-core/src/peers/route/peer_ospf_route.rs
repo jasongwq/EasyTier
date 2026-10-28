@@ -242,9 +242,43 @@ impl OspfRouteTable {
 
     pub fn get_next_hop(&self, dst_peer_id: PeerId) -> Option<OspfNextHopInfo> {
         if self.suppressed_peer_ids.contains_key(&dst_peer_id) {
+            // A peer in this set is reachable over its connection but excluded
+            // from forwarding, so every lookup for it fails even though
+            // `list_routes` still shows a path. Without this log the only
+            // symptom is a bare `RouteError(None)` at the send site, which
+            // points at the routing table rather than at the suppression.
+            tracing::warn!(
+                ?dst_peer_id,
+                suppressed = ?self
+                    .suppressed_peer_ids
+                    .iter()
+                    .map(|entry| *entry.key())
+                    .collect::<Vec<_>>(),
+                "next hop lookup denied: peer is suppressed"
+            );
             return None;
         }
-        self.get_topology_next_hop(dst_peer_id)
+        let next_hop = self.get_topology_next_hop(dst_peer_id);
+        if next_hop.is_none() {
+            // Distinguish "suppressed" from "never computed". A peer can have a
+            // live connection and still be missing from the next-hop map when
+            // the graph pass skipped it, and the two failures need different
+            // fixes.
+            let known = self.next_hop_map.contains_key(&dst_peer_id);
+            let version = self
+                .next_hop_map
+                .get(&dst_peer_id)
+                .map(|x| x.version)
+                .unwrap_or_default();
+            tracing::warn!(
+                ?dst_peer_id,
+                present_in_map = known,
+                entry_version = version,
+                current_version = self.next_hop_map_version.get(),
+                "next hop lookup failed"
+            );
+        }
+        next_hop
     }
 
     pub fn get_topology_next_hop(&self, dst_peer_id: PeerId) -> Option<OspfNextHopInfo> {
@@ -324,6 +358,14 @@ impl OspfRouteTable {
 
         for (&src_peer_id, src_node_idx) in &peer_id_to_node_index {
             if src_peer_id != my_peer_id && snapshot.suppressed_peer_ids.contains(&src_peer_id) {
+                // The node stays in the graph but contributes no outgoing
+                // edges, so nothing routes through it. Log it here: the next
+                // hop lookup only reports the symptom, and the reason a peer
+                // entered the suppressed set is set far away from this pass.
+                tracing::warn!(
+                    ?src_peer_id,
+                    "ospf graph skipped outgoing edges for suppressed peer"
+                );
                 continue;
             }
             let connected_peers: BTreeSet<_> =
@@ -423,6 +465,29 @@ impl OspfRouteTable {
         }
 
         // Step 3: second Dijkstra on subgraph, choose least-cost among shortest-hop paths.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let unreachable: Vec<_> = graph
+                .node_references()
+                .filter(|(idx, _)| !path_len_map.contains_key(idx))
+                .map(|(_, peer_id)| *peer_id)
+                .collect();
+            let kept: Vec<_> = subgraph
+                .edge_references()
+                .filter_map(|edge| {
+                    let (src, tgt) = subgraph.edge_endpoints(edge.id())?;
+                    Some((*subgraph.node_weight(src)?, *subgraph.node_weight(tgt)?))
+                })
+                .collect();
+            tracing::debug!(
+                version,
+                total_nodes = graph.node_count(),
+                reached_nodes = path_len_map.len(),
+                ?unreachable,
+                kept_edges = kept.len(),
+                ?kept,
+                "least-hop subgraph built"
+            );
+        }
         self.gen_next_hop_map_with_least_cost(&subgraph, &start_node_idx.unwrap(), version);
     }
 
@@ -507,6 +572,37 @@ impl OspfRouteTable {
         } else {
             self.gen_next_hop_map_with_least_cost(&graph, &start_node, version);
         };
+
+        // A peer can hold a live connection and still be absent from
+        // `next_hop_map` when the graph pass never linked it to us, and the
+        // send site then reports only `RouteError(None)`. Log what the pass
+        // actually saw so the two cases are distinguishable.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let nodes: Vec<_> = graph
+                .node_indices()
+                .filter_map(|idx| graph.node_weight(idx).copied())
+                .collect();
+            let edges: Vec<_> = graph
+                .edge_indices()
+                .filter_map(|idx| {
+                    let (src, dst) = graph.edge_endpoints(idx)?;
+                    Some((
+                        *graph.node_weight(src)?,
+                        *graph.node_weight(dst)?,
+                        graph.edge_weight(idx).copied(),
+                    ))
+                })
+                .collect();
+            tracing::debug!(
+                version,
+                ?start_node,
+                node_count = nodes.len(),
+                edge_count = edges.len(),
+                ?nodes,
+                ?edges,
+                "ospf graph rebuilt"
+            );
+        }
 
         let mut new_cidr_prefix_trie = PrefixMap::new();
         let mut new_cidr_v6_prefix_trie = PrefixMap::new();

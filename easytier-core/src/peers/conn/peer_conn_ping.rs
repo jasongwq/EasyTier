@@ -343,6 +343,14 @@ impl PeerConnPinger {
             self.loss_rate_stats
                 .store((loss_rate_1 * 100.0) as u32, Ordering::Relaxed);
         }
+
+        // The other way this connection dies. Logged at the same level as the
+        // receive-loop exit so a run shows which of the two fired first.
+        tracing::warn!(
+            node_id = my_node_id,
+            last_loss_counter = loss_counter.load(Ordering::Relaxed),
+            "pingpong loop exited"
+        );
     }
 }
 
