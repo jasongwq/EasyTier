@@ -134,6 +134,8 @@ enum SubCommand {
     MappedListener(MappedListenerArgs),
     #[command(about = "do stun test")]
     Stun,
+    #[command(about = "show underlay egresses (WANs) and how peers can reach this node")]
+    Egress,
     #[command(about = "show route info")]
     Route(RouteArgs),
     #[command(about = "show global peers info")]
@@ -740,10 +742,142 @@ fn format_credential_peers(data: &CredentialPeersData) -> String {
     builder.build().with(Style::rounded()).to_string()
 }
 
+/// Renders the egress report for one node.
+///
+/// Kept free of I/O so the multi-egress branches can be exercised without a
+/// running instance, which is otherwise the only way to reach them.
+fn render_egress_report(stun_info: &easytier::proto::common::StunInfo) -> String {
+    use std::fmt::Write as _;
+
+    let egresses = stun_info.egress_endpoints_or_single();
+    let multi_egress = egresses.len() > 1;
+    let per_egress_nat_type = stun_info.effective_udp_nat_type(true);
+    let punchable = egresses
+        .iter()
+        .filter(|egress| egress.min_port == egress.max_port)
+        .count();
+    let mut out = String::new();
+
+    let _ = writeln!(
+        out,
+        "Egresses: {}{}{}",
+        egresses.len(),
+        if multi_egress {
+            " (multi-WAN CPE detected)"
+        } else {
+            ""
+        },
+        if multi_egress && punchable > 0 && punchable < egresses.len() {
+            format!(", {punchable} directly punchable")
+        } else {
+            String::new()
+        }
+    );
+
+    if egresses.is_empty() {
+        out.push_str(
+            "No egress observed yet. The STUN probe has not completed, or no STUN server is \
+             reachable.\n",
+        );
+        return out;
+    }
+
+    let mut table = tabled::builder::Builder::default();
+    table.push_record(["#", "Public IP", "Ports", "Port mapping"]);
+    for (idx, egress) in egresses.iter().enumerate() {
+        let single_port = egress.min_port == egress.max_port;
+        let ports = if single_port {
+            egress.min_port.to_string()
+        } else {
+            format!("{}-{}", egress.min_port, egress.max_port)
+        };
+        // A single port means the egress maps endpoint-independently, so a peer
+        // that learns it can punch straight at it. A range means the port
+        // depends on the destination: peers still try the lowest one, and it
+        // sometimes works, but nothing guarantees it.
+        let mapping = if single_port {
+            "endpoint-independent"
+        } else {
+            "per-destination (tried, unreliable)"
+        };
+        table.push_record([
+            (idx + 1).to_string(),
+            egress.public_ip.clone(),
+            ports,
+            mapping.to_owned(),
+        ]);
+    }
+    let _ = writeln!(out, "{}", table.build().with(Style::markdown()));
+
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Per-egress NAT type: {per_egress_nat_type:?}");
+    // The plain value is what peers that predate multi-egress support see. When
+    // it differs from the per-egress verdict those peers relay instead of
+    // punching, which is intentional: a half-open path is worse than a relay.
+    let _ = writeln!(
+        out,
+        "Legacy NAT type (older peers): {:?}",
+        NatType::try_from(stun_info.udp_nat_type).unwrap_or(NatType::Unknown)
+    );
+
+    match stun_info.egress_mapping_stable {
+        Some(true) => {
+            let _ = writeln!(
+                out,
+                "Mapping stability: stable (repeated probes to the same server agreed, so the CPE \
+                 does not spread one flow across WANs)"
+            );
+        }
+        Some(false) => {
+            let _ = writeln!(
+                out,
+                "Mapping stability: UNSTABLE (a single flow is spread across WANs, which no port \
+                 prediction can punch through — expect relay)"
+            );
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "Mapping stability: not measured (repeat probe incomplete)"
+            );
+        }
+    }
+
+    let _ = writeln!(out);
+    if per_egress_nat_type == NatType::Symmetric {
+        let _ = writeln!(
+            out,
+            "P2P: relay only. No egress keeps a stable port, so a peer has no address to punch \
+             at."
+        );
+    } else if multi_egress && punchable < egresses.len() {
+        let _ = writeln!(
+            out,
+            "P2P: punchable. Peers are given all {} addresses and try each in turn, so the {} \
+             endpoint-independent egress(es) carry the connection. The per-destination ones are \
+             still offered in case the CPE happens to pick the port we named.",
+            egresses.len(),
+            punchable
+        );
+    } else if multi_egress {
+        let _ = writeln!(
+            out,
+            "P2P: punchable. Peers must be told every egress above, and only peers that advertise \
+             multi-egress support will use them."
+        );
+    } else {
+        let _ = writeln!(out, "P2P: punchable.");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use easytier::proto::api::instance::PeerConnInfo;
+    use easytier::proto::{
+        api::instance::PeerConnInfo,
+        common::{EgressEndpoint, StunInfo},
+    };
 
     const CREDENTIAL_FINGERPRINT: &str =
         "4bb06f8e4e3a7715d201d573d0aa423762e55dabd61a2c02278fa56cc6d294e0";
@@ -778,6 +912,215 @@ mod tests {
             hostname: format!("peer-{peer_id}"),
             ..Default::default()
         }
+    }
+
+    fn egress_endpoint(ip: &str, min_port: u32, max_port: u32) -> EgressEndpoint {
+        EgressEndpoint {
+            public_ip: ip.to_owned(),
+            min_port,
+            max_port,
+        }
+    }
+
+    #[test]
+    fn egress_command_parses() {
+        let cli = Cli::try_parse_from(["easytier-cli", "egress"]).unwrap();
+        assert!(matches!(cli.sub_command, SubCommand::Egress));
+    }
+
+    #[test]
+    fn single_egress_report_states_punchable() {
+        let stun_info = StunInfo {
+            udp_nat_type: NatType::PortRestricted as i32,
+            egress_count: 1,
+            egress_endpoints: vec![egress_endpoint("203.0.113.1", 5000, 5000)],
+            egress_mapping_stable: Some(true),
+            ..Default::default()
+        };
+
+        let report = render_egress_report(&stun_info);
+
+        assert!(report.contains("Egresses: 1\n"), "{report}");
+        assert!(!report.contains("multi-WAN"), "{report}");
+        assert!(report.contains("203.0.113.1"), "{report}");
+        assert!(
+            report.contains("Per-egress NAT type: PortRestricted"),
+            "{report}"
+        );
+        assert!(report.contains("P2P: punchable."), "{report}");
+    }
+
+    #[test]
+    fn multi_egress_report_lists_every_wan_and_its_own_ports() {
+        let stun_info = StunInfo {
+            // Legacy readers are told Symmetric on purpose, so they relay.
+            udp_nat_type: NatType::Symmetric as i32,
+            multi_egress_udp_nat_type: NatType::PortRestricted as i32,
+            egress_count: 2,
+            egress_endpoints: vec![
+                egress_endpoint("203.0.113.1", 5000, 5000),
+                egress_endpoint("198.51.100.1", 6000, 6000),
+            ],
+            egress_mapping_stable: Some(true),
+            ..Default::default()
+        };
+
+        let report = render_egress_report(&stun_info);
+
+        assert!(
+            report.contains("Egresses: 2 (multi-WAN CPE detected)"),
+            "{report}"
+        );
+        assert!(report.contains("203.0.113.1"), "{report}");
+        assert!(report.contains("198.51.100.1"), "{report}");
+        assert!(
+            report.contains("Per-egress NAT type: PortRestricted"),
+            "{report}"
+        );
+        // The legacy value is shown so the relay behaviour of older peers is
+        // explainable from the output alone.
+        assert!(
+            report.contains("Legacy NAT type (older peers): Symmetric"),
+            "{report}"
+        );
+        assert!(report.contains("only peers that advertise"), "{report}");
+    }
+
+    #[test]
+    fn per_destination_mapping_is_marked_unreachable() {
+        let stun_info = StunInfo {
+            udp_nat_type: NatType::Symmetric as i32,
+            multi_egress_udp_nat_type: NatType::Symmetric as i32,
+            egress_count: 1,
+            egress_endpoints: vec![egress_endpoint("203.0.113.1", 5000, 6000)],
+            egress_mapping_stable: Some(true),
+            ..Default::default()
+        };
+
+        let report = render_egress_report(&stun_info);
+
+        assert!(report.contains("5000-6000"), "{report}");
+        assert!(
+            report.contains("per-destination (tried, unreliable)"),
+            "{report}"
+        );
+        assert!(report.contains("P2P: relay only"), "{report}");
+    }
+
+    #[test]
+    fn mixed_cpe_advertises_every_wan_and_stays_punchable() {
+        // Reported from a real dual-WAN host: WAN1 keeps one port, WAN2 rehashes
+        // per destination. Both are advertised so peers can try each; WAN1 is
+        // what actually carries the connection, but WAN2 is not withheld.
+        let stun_info = StunInfo {
+            udp_nat_type: NatType::PortRestricted as i32,
+            multi_egress_udp_nat_type: NatType::PortRestricted as i32,
+            egress_count: 2,
+            egress_endpoints: vec![
+                egress_endpoint("60.12.249.167", 19073, 19073),
+                egress_endpoint("122.224.109.114", 28189, 45213),
+            ],
+            egress_mapping_stable: Some(true),
+            ..Default::default()
+        };
+
+        let report = render_egress_report(&stun_info);
+
+        assert!(
+            report.contains("Egresses: 2 (multi-WAN CPE detected), 1 directly punchable"),
+            "{report}"
+        );
+        assert!(report.contains("60.12.249.167"), "{report}");
+        assert!(report.contains("122.224.109.114"), "{report}");
+        assert!(report.contains("endpoint-independent"), "{report}");
+        assert!(
+            report.contains("per-destination (tried, unreliable)"),
+            "{report}"
+        );
+        assert!(
+            report.contains("Peers are given all 2 addresses"),
+            "{report}"
+        );
+        assert!(!report.contains("relay only"), "{report}");
+    }
+
+    #[test]
+    fn all_egresses_unpredictable_stays_relay() {
+        let stun_info = StunInfo {
+            udp_nat_type: NatType::Symmetric as i32,
+            multi_egress_udp_nat_type: NatType::Symmetric as i32,
+            egress_count: 2,
+            egress_endpoints: vec![
+                egress_endpoint("203.0.113.1", 5000, 6000),
+                egress_endpoint("198.51.100.1", 7000, 8000),
+            ],
+            egress_mapping_stable: Some(true),
+            ..Default::default()
+        };
+
+        let report = render_egress_report(&stun_info);
+
+        assert!(report.contains("P2P: relay only"), "{report}");
+    }
+
+    #[test]
+    fn unstable_mapping_is_called_out_as_relay() {
+        let stun_info = StunInfo {
+            udp_nat_type: NatType::Symmetric as i32,
+            egress_count: 1,
+            egress_endpoints: vec![egress_endpoint("203.0.113.1", 5000, 5000)],
+            egress_mapping_stable: Some(false),
+            ..Default::default()
+        };
+
+        let report = render_egress_report(&stun_info);
+
+        assert!(report.contains("Mapping stability: UNSTABLE"), "{report}");
+        assert!(report.contains("P2P: relay only"), "{report}");
+    }
+
+    #[test]
+    fn unmeasured_stability_is_not_reported_as_unstable() {
+        let stun_info = StunInfo {
+            udp_nat_type: NatType::PortRestricted as i32,
+            egress_count: 1,
+            egress_endpoints: vec![egress_endpoint("203.0.113.1", 5000, 5000)],
+            egress_mapping_stable: None,
+            ..Default::default()
+        };
+
+        let report = render_egress_report(&stun_info);
+
+        assert!(report.contains("not measured"), "{report}");
+        assert!(!report.contains("UNSTABLE"), "{report}");
+    }
+
+    #[test]
+    fn no_egress_yet_is_reported_without_a_table() {
+        let report = render_egress_report(&StunInfo::default());
+
+        assert!(report.contains("Egresses: 0"), "{report}");
+        assert!(report.contains("No egress observed yet"), "{report}");
+        assert!(!report.contains("Public IP"), "{report}");
+    }
+
+    #[test]
+    fn older_peer_without_endpoints_falls_back_to_public_ip() {
+        // A peer that predates `egress_endpoints` only reports `public_ip`, and
+        // the report must still describe it instead of claiming zero egresses.
+        let stun_info = StunInfo {
+            udp_nat_type: NatType::PortRestricted as i32,
+            public_ip: vec!["203.0.113.9".to_owned()],
+            min_port: 5000,
+            max_port: 5000,
+            ..Default::default()
+        };
+
+        let report = render_egress_report(&stun_info);
+
+        assert!(report.contains("Egresses: 1"), "{report}");
+        assert!(report.contains("203.0.113.9"), "{report}");
+        assert!(report.contains("P2P: punchable."), "{report}");
     }
 
     #[test]
@@ -3353,6 +3696,16 @@ impl<'a> CommandHandler<'a> {
                     "UDP Stun Type",
                     format!("{:?}", stun_info.udp_nat_type()).as_str(),
                 ]);
+                if stun_info.egress_endpoints.len() > 1 {
+                    builder.push_record(vec![
+                        "Egresses",
+                        format!(
+                            "{} (multi-WAN; see `easytier-cli egress`)",
+                            stun_info.egress_endpoints.len()
+                        )
+                        .as_str(),
+                    ]);
+                }
                 ip_list.interface_ipv4s.iter().for_each(|ip| {
                     builder.push_record(vec!["Interface IPv4", ip.to_string().as_str()]);
                 });
@@ -3369,6 +3722,31 @@ impl<'a> CommandHandler<'a> {
                 println!("{}", builder.build().with(Style::markdown()));
                 Ok(())
             }
+        })
+    }
+
+    /// Reports the underlay egresses this node is reachable through, and what
+    /// that means for P2P.
+    ///
+    /// Behind a multi-WAN CPE each egress maps this node to its own public
+    /// address, and whether peers can punch through depends on whether the CPE
+    /// pins an egress per flow. Both facts come from the running instance, so
+    /// the socket mark and network namespace the instance actually uses are
+    /// the ones probed — unlike `easytier-cli stun`, which probes from a fresh
+    /// default context.
+    async fn handle_egress(&self) -> Result<(), Error> {
+        let results = self
+            .collect_instance_results(|handler| Box::pin(handler.fetch_node_info()))
+            .await?;
+
+        if *self.output_format == OutputFormat::Json {
+            return self.print_json_results(results);
+        }
+
+        self.print_results(&results, |node_info| {
+            let stun_info = node_info.stun_info.clone().unwrap_or_default();
+            print!("{}", render_egress_report(&stun_info));
+            Ok(())
         })
     }
 
@@ -3808,6 +4186,9 @@ async fn main() -> Result<(), Error> {
             })
             .await
             .unwrap();
+        }
+        SubCommand::Egress => {
+            handler.handle_egress().await?;
         }
         SubCommand::PeerCenter => {
             handler.handle_peer_center().await?;
