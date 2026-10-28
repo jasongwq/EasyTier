@@ -21,11 +21,33 @@ pub use dhcp::DhcpConfig;
 pub(crate) use dhcp::valid_ipv6_subnet;
 pub use encryption::EncryptionAlgorithm;
 
+/// STUN servers used to learn a node's own public address.
+///
+/// A multi-WAN CPE picks an egress per destination, so the set has to cover
+/// several carriers: probing only one carrier's servers reports that
+/// carrier's address even when the CPE would send real traffic out another
+/// one, and peers then punch at an address the node cannot be reached on.
+///
+/// Entries are ordered so that the carriers most likely to be the actual
+/// egress come first; each comment below records which carrier it reaches.
 pub(crate) const DEFAULT_UDP_STUN_SERVERS: &[&str] = &[
+    // easytier's own, reachable from every carrier.
     "txt:stun.easytier.cn",
+    // China Mobile, in three provinces. A mobile subscriber reaching a
+    // mobile-hosted server stays on the mobile backbone instead of being
+    // routed across to telecom, so these report the address the CPE will
+    // actually use for mobile peers.
     "stun.miwifi.com",
-    "stun.chat.bilibili.com",
     "stun.hitv.com",
+    "stun.douyucdn.cn:18000",
+    // Multi-carrier CDN nodes, which cover telecom and unicom egresses.
+    "stun.chat.bilibili.com",
+    // Outside China. Reaching these means leaving through whichever egress
+    // the CPE prefers for international traffic, which is often a different
+    // WAN than the domestic one. Without them a CPE that splits domestic and
+    // international traffic reports only the domestic egress.
+    "stun.voipbuster.com",
+    "stun.t-online.de",
 ];
 pub(crate) const DEFAULT_TCP_STUN_SERVERS: &[&str] = &[
     "stun.hot-chilli.net",
