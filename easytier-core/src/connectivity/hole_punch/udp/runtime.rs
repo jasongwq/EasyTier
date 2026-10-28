@@ -78,6 +78,9 @@ pub struct UdpPunchListener<S> {
     pub socket: Arc<S>,
     pub hole_punch_observers: UdpHolePunchObserverRegistry,
     pub mapped_addr: SocketAddr,
+    /// Every public address this listener is reachable at, one per underlay
+    /// egress. Contains at least `mapped_addr`.
+    pub mapped_addrs: Vec<SocketAddr>,
     pub conn_counter: Arc<dyn ListenerConnectionCounter>,
     pub acceptor: Box<dyn UdpPunchAcceptor>,
     pub(crate) port_mapping_lease: Option<Box<dyn UdpPortMappingLease>>,
@@ -85,6 +88,9 @@ pub struct UdpPunchListener<S> {
 
 pub struct UdpResolvedPublicAddr {
     pub mapped_addr: SocketAddr,
+    /// Every public address the listener is reachable at, one per underlay
+    /// egress. Contains at least `mapped_addr`.
+    pub mapped_addrs: Vec<SocketAddr>,
     pub(crate) port_mapping_lease: Option<Box<dyn UdpPortMappingLease>>,
 }
 
@@ -99,6 +105,10 @@ pub struct SelectPunchListener {
 pub struct SelectPunchListenerResponse {
     pub listener_mapped_addr: SocketAddr,
     pub transaction_id: Option<u32>,
+    /// Every endpoint this listener is reachable at, one per underlay egress.
+    /// Always contains `listener_mapped_addr`; has more than one entry only
+    /// when the host sits behind a multi-WAN CPE.
+    pub endpoints: Vec<SocketAddr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +125,10 @@ pub struct SendPunchPacketCone {
 pub struct SendPunchPacketHardSym {
     pub listener_mapped_addr: SocketAddr,
     pub public_ips: Vec<Ipv4Addr>,
+    /// Endpoints to punch, one per underlay egress, each carrying its own port.
+    /// When non-empty this replaces `public_ips`, because a multi-WAN CPE can
+    /// map different egresses to different ports.
+    pub target_endpoints: Vec<SocketAddr>,
     pub transaction_id: u32,
     pub port_index: u32,
     pub round: u32,
@@ -129,6 +143,9 @@ pub struct SendPunchPacketHardSymResponse {
 pub struct SendPunchPacketEasySym {
     pub listener_mapped_addr: SocketAddr,
     pub public_ips: Vec<Ipv4Addr>,
+    /// Endpoints to punch, one per underlay egress, each carrying its own port.
+    /// When non-empty this replaces `public_ips`.
+    pub target_endpoints: Vec<SocketAddr>,
     pub transaction_id: u32,
     pub base_port_num: u32,
     pub max_port_num: u32,

@@ -1,5 +1,5 @@
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -86,6 +86,11 @@ where
         "selected hole-punch listener"
     );
     let remote_mapped_addr = resp.listener_mapped_addr;
+    let remote_addrs = if resp.endpoints.is_empty() {
+        vec![remote_mapped_addr]
+    } else {
+        resp.endpoints.clone()
+    };
 
     let local_socket = UdpHolePunchRuntime::bind_udp(
         runtime.as_ref(),
@@ -104,13 +109,15 @@ where
 
     tracing::debug!(
         ?local_mapped_addr,
-        ?remote_mapped_addr,
+        ?remote_addrs,
         "hole punch got remote listener"
     );
 
     let punch_packet = new_hole_punch_packet(tid, HOLE_PUNCH_PACKET_BODY_LEN).into_bytes();
 
-    send_from_local(local_socket.as_ref(), &punch_packet, remote_mapped_addr).await?;
+    for remote_addr in &remote_addrs {
+        send_from_local(local_socket.as_ref(), &punch_packet, *remote_addr).await?;
+    }
 
     let signaling_for_task = signaling.clone();
     let _punch_task = AbortOnDropHandle::new(tokio::spawn(async move {
@@ -135,26 +142,36 @@ where
     // The session layer owns receive while connecting. A reachable listener can
     // reply to SYN's actual source even when the STUN candidate differs.
     for _ in 0..2 {
-        let connect = runtime.connect_with_socket(local_socket.clone(), remote_mapped_addr);
-        tokio::pin!(connect);
-        loop {
-            tokio::select! {
-                result = &mut connect => {
-                    match result {
-                        Ok(socket) => {
-                            tracing::info!(?socket, "hole punched");
-                            return Ok(Some(socket));
-                        }
-                        Err(e) => {
-                            tracing::error!(?e, "failed to connect with socket");
-                            break;
+        let mut connected = None;
+        for remote_addr in &remote_addrs {
+            let connect = runtime.connect_with_socket(local_socket.clone(), *remote_addr);
+            tokio::pin!(connect);
+            loop {
+                tokio::select! {
+                    result = &mut connect => {
+                        match result {
+                            Ok(socket) => {
+                                tracing::info!(?socket, "hole punched");
+                                connected = Some(socket);
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::debug!(?e, ?remote_addr, "failed to connect with socket");
+                                break;
+                            }
                         }
                     }
-                }
-                _ = crate::foundation::time::sleep(std::time::Duration::from_millis(200)) => {
-                    send_from_local(local_socket.as_ref(), &punch_packet, remote_mapped_addr).await?;
+                    _ = crate::foundation::time::sleep(std::time::Duration::from_millis(200)) => {
+                        send_from_local(local_socket.as_ref(), &punch_packet, *remote_addr).await?;
+                    }
                 }
             }
+            if connected.is_some() {
+                break;
+            }
+        }
+        if connected.is_some() {
+            return Ok(connected);
         }
     }
 
@@ -248,6 +265,9 @@ where
         }
     }
 
+    // Each field of the request travels as its own argument; bundling them into
+    // a struct would only move the list one level down.
+    #[allow(clippy::too_many_arguments)]
     async fn remote_send_hole_punch_packet_predictable(
         signaling: Arc<S>,
         dst_peer_id: PeerId,
@@ -255,6 +275,7 @@ where
         my_nat_info: UdpNatType,
         remote_mapped_addr: SocketAddr,
         public_ips: Vec<Ipv4Addr>,
+        local_endpoints: Vec<SocketAddr>,
         tid: u32,
     ) {
         let Some(inc) = my_nat_info.get_inc_of_easy_sym() else {
@@ -263,6 +284,7 @@ where
         let req = SendPunchPacketEasySym {
             listener_mapped_addr: remote_mapped_addr,
             public_ips,
+            target_endpoints: local_endpoints,
             transaction_id: tid,
             base_port_num: base_port_for_easy_sym.unwrap() as u32,
             max_port_num: 50,
@@ -273,11 +295,13 @@ where
         tracing::debug!(?ret, "send punch packet for easy sym return");
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn remote_send_hole_punch_packet_random(
         signaling: Arc<S>,
         dst_peer_id: PeerId,
         remote_mapped_addr: SocketAddr,
         public_ips: Vec<Ipv4Addr>,
+        local_endpoints: Vec<SocketAddr>,
         tid: u32,
         round: u32,
         port_index: u32,
@@ -285,6 +309,7 @@ where
         let req = SendPunchPacketHardSym {
             listener_mapped_addr: remote_mapped_addr,
             public_ips,
+            target_endpoints: local_endpoints,
             transaction_id: tid,
             round,
             port_index,
@@ -304,13 +329,18 @@ where
         udp_array: &Arc<UdpSocketArray<R>>,
         packet: &[u8],
         tid: u32,
-        remote_mapped_addr: SocketAddr,
+        remote_addrs: &[SocketAddr],
         punch_task: &AbortOnDropHandle<T>,
     ) -> anyhow::Result<Option<UdpPunchSocket>> {
         let mut ret_socket = None;
         let mut finish_time: Option<Instant> = None;
         while finish_time.is_none() || finish_time.as_ref().unwrap().elapsed().as_millis() < 1000 {
-            udp_array.send_with_all(packet, remote_mapped_addr).await?;
+            // A multi-WAN peer is reachable at one endpoint per egress, and
+            // which one works depends on the path the CPE picks for us. Punch
+            // at all of them; the first reply tells us the winner.
+            for remote_addr in remote_addrs {
+                udp_array.send_with_all(packet, *remote_addr).await?;
+            }
 
             crate::foundation::time::sleep(std::time::Duration::from_millis(200)).await;
 
@@ -323,17 +353,39 @@ where
                 continue;
             };
 
-            match self
-                .runtime
-                .connect_with_socket(socket.socket.clone(), remote_mapped_addr)
-                .await
-            {
-                Ok(socket) => {
-                    ret_socket.replace(socket);
+            // The reply came from an address the peer demonstrably reaches us
+            // at, so prefer it over the advertised candidate.
+            let observed = socket.remote_addr;
+            let candidates = std::iter::once(observed).chain(
+                remote_addrs
+                    .iter()
+                    .copied()
+                    .filter(|addr| *addr != observed),
+            );
+
+            let mut connected = None;
+            for candidate in candidates {
+                match self
+                    .runtime
+                    .connect_with_socket(socket.socket.clone(), candidate)
+                    .await
+                {
+                    Ok(connected_socket) => {
+                        connected = Some(connected_socket);
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::debug!(?e, ?candidate, "failed to connect with socket");
+                    }
+                }
+            }
+
+            match connected {
+                Some(connected) => {
+                    ret_socket.replace(connected);
                     break;
                 }
-                Err(e) => {
-                    tracing::error!(?e, "failed to connect with socket");
+                None => {
                     udp_array.add_new_socket(socket.socket).await?;
                     continue;
                 }
@@ -366,15 +418,25 @@ where
             .await?;
 
         let remote_mapped_addr = resp.listener_mapped_addr;
+        // A multi-WAN peer advertises one endpoint per egress and we cannot
+        // tell which one its CPE will route our reply through, so punch at all
+        // of them. Single-egress peers yield a one-element list.
+        let remote_addrs = if resp.endpoints.is_empty() {
+            vec![remote_mapped_addr]
+        } else {
+            resp.endpoints.clone()
+        };
 
         if self.try_direct_connect.load(Ordering::Relaxed) {
             let socket = self.runtime.bind_direct_connect_udp().await?;
-            if let Ok(socket) = self
-                .runtime
-                .connect_with_socket(socket, remote_mapped_addr)
-                .await
-            {
-                return Ok(Some(socket));
+            for remote_addr in &remote_addrs {
+                if let Ok(socket) = self
+                    .runtime
+                    .connect_with_socket(socket.clone(), *remote_addr)
+                    .await
+                {
+                    return Ok(Some(socket));
+                }
             }
         }
 
@@ -387,6 +449,20 @@ where
         if public_ips.is_empty() {
             return Err(anyhow::anyhow!("failed to get public ips").into());
         }
+        // Tell the remote which endpoint to punch at on our side. Behind a
+        // multi-WAN CPE each egress maps to its own port, so a bare IP list
+        // plus one shared port would only hit one of them.
+        let local_endpoints: Vec<SocketAddr> = stun_info
+            .egress_endpoints_or_single()
+            .into_iter()
+            .filter_map(|endpoint| {
+                let ip: Ipv4Addr = endpoint.public_ip.parse().ok()?;
+                let port = u16::try_from(endpoint.min_port)
+                    .ok()
+                    .filter(|port| *port != 0)?;
+                Some(SocketAddr::V4(SocketAddrV4::new(ip, port)))
+            })
+            .collect();
 
         let tid = rand::thread_rng().r#gen();
         let packet = new_hole_punch_packet(tid, HOLE_PUNCH_PACKET_BODY_LEN).into_bytes();
@@ -395,7 +471,9 @@ where
 
         let port_index = *last_port_idx as u32;
         let base_port_for_easy_sym = self.get_base_port_for_easy_sym(my_nat_info).await;
-        udp_array.send_with_all(&packet, remote_mapped_addr).await?;
+        for remote_addr in &remote_addrs {
+            udp_array.send_with_all(&packet, *remote_addr).await?;
+        }
 
         if self.punch_predictably.load(Ordering::Relaxed) && base_port_for_easy_sym.is_some() {
             let signaling = self.signaling.clone();
@@ -407,11 +485,12 @@ where
                     my_nat_info,
                     remote_mapped_addr,
                     public_ips.clone(),
+                    local_endpoints.clone(),
                     tid,
                 ),
             ));
             let ret_socket = self
-                .check_hole_punch_result(&udp_array, &packet, tid, remote_mapped_addr, &punch_task)
+                .check_hole_punch_result(&udp_array, &packet, tid, &remote_addrs, &punch_task)
                 .await?;
 
             let task_ret = punch_task.await;
@@ -428,12 +507,13 @@ where
                 dst_peer_id,
                 remote_mapped_addr,
                 public_ips.clone(),
+                local_endpoints,
                 tid,
                 round,
                 port_index,
             )));
         let ret_socket = self
-            .check_hole_punch_result(&udp_array, &packet, tid, remote_mapped_addr, &punch_task)
+            .check_hole_punch_result(&udp_array, &packet, tid, &remote_addrs, &punch_task)
             .await?;
 
         let punch_task_result = punch_task.await;
@@ -710,8 +790,10 @@ mod tests {
         ) -> anyhow::Result<super::super::UdpResolvedPublicAddr> {
             assert_eq!(socket.local_addr()?.port(), 10000);
             self.resolve_count.fetch_add(1, Ordering::Relaxed);
+            let mapped_addr = SocketAddr::from(([203, 0, 113, 1], 40000));
             Ok(super::super::UdpResolvedPublicAddr {
-                mapped_addr: SocketAddr::from(([203, 0, 113, 1], 40000)),
+                mapped_addr,
+                mapped_addrs: vec![mapped_addr],
                 port_mapping_lease: None,
             })
         }
@@ -980,9 +1062,11 @@ mod tests {
                 .then_some(request.transaction_id)
                 .flatten();
             self.listener_requests.lock().await.push(request);
+            let listener_mapped_addr = SocketAddr::from(([127, 0, 0, 1], 30000));
             Ok(super::super::SelectPunchListenerResponse {
-                listener_mapped_addr: SocketAddr::from(([127, 0, 0, 1], 30000)),
+                listener_mapped_addr,
                 transaction_id,
+                endpoints: vec![listener_mapped_addr],
             })
         }
 

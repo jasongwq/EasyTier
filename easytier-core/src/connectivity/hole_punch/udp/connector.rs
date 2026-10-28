@@ -15,7 +15,6 @@ use crate::{
     config::PeerId,
     connectivity::stun::StunInfoProvider,
     foundation::task::{ExternalTaskSignal, PeerTaskLauncher, PeerTaskManager},
-    proto::common::NatType,
 };
 
 use crate::connectivity::hole_punch::policy::BackOff;
@@ -397,10 +396,11 @@ where
 
     async fn collect_peers_need_task(&self) -> Vec<Self::CollectPeerItem> {
         let data = &self.0;
-        let my_nat_type = data.stun.get_stun_info().udp_nat_type;
-        let my_nat_type: UdpNatType = NatType::try_from(my_nat_type)
-            .unwrap_or(NatType::Unknown)
-            .into();
+        // This process understands per-egress classification, so it judges its
+        // own reachability that way even though peers that predate the feature
+        // still read the conservative `udp_nat_type`.
+        let my_nat_type = data.stun.get_stun_info().effective_udp_nat_type(true);
+        let my_nat_type: UdpNatType = my_nat_type.into();
         if !my_nat_type.is_sym() {
             data.sym_to_cone_client.clear_udp_array().await;
         }

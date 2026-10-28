@@ -29,10 +29,30 @@ use crate::{
 const CONE_RPC_TIMEOUT_MS: i32 = 4000;
 const SYMMETRIC_RPC_TIMEOUT_MS: i32 = 4000;
 const BOTH_EASY_SYMMETRIC_RPC_TIMEOUT_MS: i32 = 2000;
+/// Selecting a listener is the slowest signaling call by far: the peer has to
+/// create a listener, resolve its public address through STUN, and answer. A
+/// peer that is only reachable over a relayed path pays the relay hop twice,
+/// and the default 5s budget expires before the answer arrives — the punch
+/// then retries forever without ever reaching the packet exchange. This is a
+/// ceiling, not a delay: a directly connected peer answers in milliseconds.
+///
+/// The relay hop is the expensive half. A relay carrying other peers' bulk
+/// traffic queues our request behind their packets: measured `sync_route_info`
+/// round trips through a loaded relay reach 2.5s while the same link pings in
+/// 7ms. Two hops of that plus the listener's own STUN probes overran the old
+/// 15s budget, so the call timed out while the peer was still working on it.
+const SELECT_LISTENER_RPC_TIMEOUT_MS: i32 = 30000;
 
 fn cone_controller() -> BaseController {
     BaseController {
         timeout_ms: CONE_RPC_TIMEOUT_MS,
+        ..Default::default()
+    }
+}
+
+fn select_listener_controller() -> BaseController {
+    BaseController {
+        timeout_ms: SELECT_LISTENER_RPC_TIMEOUT_MS,
         ..Default::default()
     }
 }
@@ -71,13 +91,26 @@ fn select_listener_request_from_rpc(input: SelectPunchListenerRequest) -> Select
 fn select_listener_response_from_rpc(
     response: SelectPunchListenerResponse,
 ) -> Result<CoreSelectPunchListenerResponse, UdpHolePunchSignalError> {
+    let listener_mapped_addr = SocketAddr::from(
+        response
+            .listener_mapped_addr
+            .ok_or_else(|| missing_field("listener_mapped_addr"))?,
+    );
+    // Older peers send no endpoints; a single-egress peer sends one that
+    // matches `listener_mapped_addr`. Either way the primary address must be
+    // in the set so callers can punch at every entry without special cases.
+    let mut endpoints: Vec<SocketAddr> = response
+        .endpoints
+        .into_iter()
+        .map(SocketAddr::from)
+        .collect();
+    if !endpoints.contains(&listener_mapped_addr) {
+        endpoints.insert(0, listener_mapped_addr);
+    }
     Ok(CoreSelectPunchListenerResponse {
         transaction_id: response.transaction_id,
-        listener_mapped_addr: SocketAddr::from(
-            response
-                .listener_mapped_addr
-                .ok_or_else(|| missing_field("listener_mapped_addr"))?,
-        ),
+        listener_mapped_addr,
+        endpoints,
     })
 }
 
@@ -87,6 +120,7 @@ fn select_listener_response_to_rpc(
     SelectPunchListenerResponse {
         listener_mapped_addr: Some(response.listener_mapped_addr.into()),
         transaction_id: response.transaction_id,
+        endpoints: response.endpoints.into_iter().map(Into::into).collect(),
     }
 }
 
@@ -105,6 +139,11 @@ fn hard_symmetric_request_to_rpc(request: SendPunchPacketHardSym) -> SendPunchPa
     SendPunchPacketHardSymRequest {
         listener_mapped_addr: Some(request.listener_mapped_addr.into()),
         public_ips: request.public_ips.into_iter().map(Into::into).collect(),
+        target_endpoints: request
+            .target_endpoints
+            .into_iter()
+            .map(Into::into)
+            .collect(),
         transaction_id: request.transaction_id,
         port_index: request.port_index,
         round: request.round,
@@ -115,6 +154,11 @@ fn easy_symmetric_request_to_rpc(request: SendPunchPacketEasySym) -> SendPunchPa
     SendPunchPacketEasySymRequest {
         listener_mapped_addr: Some(request.listener_mapped_addr.into()),
         public_ips: request.public_ips.into_iter().map(Into::into).collect(),
+        target_endpoints: request
+            .target_endpoints
+            .into_iter()
+            .map(Into::into)
+            .collect(),
         transaction_id: request.transaction_id,
         base_port_num: request.base_port_num,
         max_port_num: request.max_port_num,
@@ -246,7 +290,7 @@ where
         let response = self
             .rpc_stub(dst_peer_id)
             .select_punch_listener(
-                BaseController::default(),
+                select_listener_controller(),
                 select_listener_request_to_rpc(request),
             )
             .await
@@ -393,6 +437,11 @@ fn hard_symmetric_request_from_rpc(
     Ok(SendPunchPacketHardSym {
         listener_mapped_addr: listener_addr.into(),
         public_ips: input.public_ips.into_iter().map(Into::into).collect(),
+        target_endpoints: input
+            .target_endpoints
+            .into_iter()
+            .map(SocketAddr::from)
+            .collect(),
         transaction_id: input.transaction_id,
         port_index: input.port_index,
         round: input.round,
@@ -408,6 +457,11 @@ fn easy_symmetric_request_from_rpc(
     Ok(SendPunchPacketEasySym {
         listener_mapped_addr: listener_addr.into(),
         public_ips: input.public_ips.into_iter().map(Into::into).collect(),
+        target_endpoints: input
+            .target_endpoints
+            .into_iter()
+            .map(SocketAddr::from)
+            .collect(),
         transaction_id: input.transaction_id,
         base_port_num: input.base_port_num,
         max_port_num: input.max_port_num,
@@ -602,6 +656,7 @@ mod tests {
         let response = select_listener_response_to_rpc(CoreSelectPunchListenerResponse {
             listener_mapped_addr: mapped_addr,
             transaction_id: Some(0),
+            endpoints: vec![mapped_addr],
         });
         let legacy_response =
             LegacySelectPunchListenerResponse::decode(response.encode_to_vec().as_slice()).unwrap();
@@ -619,6 +674,18 @@ mod tests {
         assert_eq!(symmetric_controller().timeout_ms, 4000);
         assert_eq!(symmetric_controller().trace_id, 0);
         assert_eq!(both_easy_symmetric_controller().timeout_ms, 2000);
+    }
+
+    #[test]
+    fn listener_selection_gets_a_longer_budget_than_the_default() {
+        // The peer must create a listener and resolve it through STUN before it
+        // can answer, and a relayed peer pays the relay hop twice. The stock 5s
+        // default expires first, so punching never even starts.
+        assert_eq!(select_listener_controller().timeout_ms, 30_000);
+        assert!(
+            select_listener_controller().timeout_ms > BaseController::default().timeout_ms,
+            "must exceed the default or the RPC keeps timing out"
+        );
     }
 
     #[test]
@@ -645,6 +712,7 @@ mod tests {
         let core_response = CoreSelectPunchListenerResponse {
             listener_mapped_addr: mapped_addr,
             transaction_id: Some(0),
+            endpoints: vec![mapped_addr],
         };
         let rpc_response = select_listener_response_to_rpc(core_response.clone());
         assert_eq!(
@@ -662,6 +730,37 @@ mod tests {
             error,
             UdpHolePunchSignalError::RemoteRejected("missing listener_mapped_addr".to_owned())
         );
+    }
+
+    #[test]
+    fn older_peer_without_endpoints_yields_the_single_primary_address() {
+        let mapped_addr: SocketAddr = "198.51.100.1:31001".parse().unwrap();
+
+        let response = select_listener_response_from_rpc(SelectPunchListenerResponse {
+            listener_mapped_addr: Some(mapped_addr.into()),
+            transaction_id: None,
+            endpoints: Vec::new(),
+        })
+        .unwrap();
+
+        assert_eq!(response.listener_mapped_addr, mapped_addr);
+        assert_eq!(response.endpoints, vec![mapped_addr]);
+    }
+
+    #[test]
+    fn multi_egress_response_keeps_every_endpoint_and_the_primary() {
+        let primary: SocketAddr = "203.0.113.1:5000".parse().unwrap();
+        let second: SocketAddr = "198.51.100.1:6000".parse().unwrap();
+
+        let response = select_listener_response_from_rpc(SelectPunchListenerResponse {
+            listener_mapped_addr: Some(primary.into()),
+            transaction_id: None,
+            endpoints: vec![second.into()],
+        })
+        .unwrap();
+
+        assert_eq!(response.listener_mapped_addr, primary);
+        assert_eq!(response.endpoints, vec![primary, second]);
     }
 
     #[test]
@@ -693,6 +792,10 @@ mod tests {
         let request = SendPunchPacketHardSym {
             listener_mapped_addr: "198.51.100.3:31003".parse().unwrap(),
             public_ips: vec![Ipv4Addr::new(203, 0, 113, 3), Ipv4Addr::new(203, 0, 113, 4)],
+            target_endpoints: vec![
+                "203.0.113.3:5000".parse().unwrap(),
+                "203.0.113.4:6000".parse().unwrap(),
+            ],
             transaction_id: 13,
             port_index: 17,
             round: 19,
@@ -722,6 +825,7 @@ mod tests {
         let request = SendPunchPacketEasySym {
             listener_mapped_addr: "198.51.100.5:31005".parse().unwrap(),
             public_ips: vec![Ipv4Addr::new(203, 0, 113, 5)],
+            target_endpoints: vec!["203.0.113.5:7000".parse().unwrap()],
             transaction_id: 15,
             base_port_num: 33000,
             max_port_num: 51,

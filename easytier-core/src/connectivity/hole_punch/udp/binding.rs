@@ -63,22 +63,27 @@ where
         None
     };
 
-    let mapped_addr = stun
-        .get_udp_port_mapping_with_socket(socket)
+    let mapped_addrs = stun
+        .get_udp_port_mappings_with_socket(socket)
         .await
         .with_context(|| format!("resolve udp public addr for {local_listener}"))?;
+    let Some(mapped_addr) = mapped_addrs.first().copied() else {
+        anyhow::bail!("no udp public addr resolved for {local_listener}");
+    };
     if let Some(lease) = &port_mapping_lease {
         lease.public_addr_resolved(mapped_addr);
     } else {
         tracing::debug!(
             %local_listener,
             stun_mapped_addr = %mapped_addr,
+            ?mapped_addrs,
             "udp public addr resolved without port mapping"
         );
     }
 
     Ok(UdpResolvedPublicAddr {
         mapped_addr,
+        mapped_addrs,
         port_mapping_lease,
     })
 }
@@ -324,8 +329,10 @@ where
         let resolved = if resolve_public_addr {
             self.resolve_public_addr(socket.clone()).await?
         } else {
+            let unspecified = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, local_port));
             UdpResolvedPublicAddr {
-                mapped_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, local_port)),
+                mapped_addr: unspecified,
+                mapped_addrs: vec![unspecified],
                 port_mapping_lease: None,
             }
         };
@@ -341,6 +348,7 @@ where
             socket,
             hole_punch_observers,
             mapped_addr: resolved.mapped_addr,
+            mapped_addrs: resolved.mapped_addrs,
             conn_counter,
             acceptor,
             port_mapping_lease: resolved.port_mapping_lease,

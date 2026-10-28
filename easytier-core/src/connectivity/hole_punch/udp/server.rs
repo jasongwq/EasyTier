@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{
         Arc,
@@ -30,8 +31,8 @@ use super::{
     SendPunchPacketHardSymResponse, UdpHolePunchInbound, UdpHolePunchRuntime,
     UdpHolePunchSignalError, UdpHolePunchTransportSink, UdpPunchListener, UdpSocketArray,
     UdpSymPunchLock, can_reuse_port_mapping_listener, can_reuse_public_listener,
-    select_reusable_port_mapping_listener_idx, select_reusable_public_listener_idx,
-    should_create_public_listener, should_retry_public_listener_selection,
+    select_listener_covering_new_egress, should_create_public_listener,
+    should_retry_public_listener_selection,
 };
 
 const MAX_K1_FOR_RANDOM_HARD_SYM: u32 = 180;
@@ -41,10 +42,13 @@ const PREPARED_CONE_PUNCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct SelectedUdpPunchListener<S> {
     /// Kept for listener-selection side effects and tests; production callers
-    /// only consume `mapped_addr`.
+    /// only consume `mapped_addr` and `mapped_addrs`.
     #[allow(dead_code)]
     pub socket: Arc<S>,
     pub mapped_addr: SocketAddr,
+    /// Every public address this listener is reachable at, one per underlay
+    /// egress. Contains at least `mapped_addr`.
+    pub mapped_addrs: Vec<SocketAddr>,
 }
 
 pub struct UdpHolePunchServer<R, T>
@@ -157,11 +161,6 @@ where
                 "send_punch_packet_easy_sym failed to find listener"
             ))?;
 
-        if request.public_ips.is_empty() {
-            tracing::warn!("send_punch_packet_easy_sym got zero len public ip");
-            anyhow::bail!("send_punch_packet_easy_sym got zero len public ip");
-        }
-
         let base_port_num = request.base_port_num;
         let max_port_num = request.max_port_num.max(1);
         let port_start = if request.is_incremental {
@@ -174,28 +173,27 @@ where
         } else {
             base_port_num.saturating_sub(1)
         };
-
         if port_end <= port_start {
             anyhow::bail!("send_punch_packet_easy_sym invalid port range");
         }
 
-        let ports = (port_start..=port_end)
-            .map(|port| port as u16)
-            .collect::<Vec<_>>();
-        tracing::debug!(
-            ?ports,
-            public_ips = ?request.public_ips,
-            "send_punch_packet_easy_sym send to ports"
-        );
+        // The sender predicts ports by offsetting the mapped port it observed.
+        // Apply that same offset on every egress instead of one absolute port,
+        // so each egress stays anchored to its own mapped port.
+        let endpoints = request_endpoints(&request.public_ips, &request.target_endpoints)?;
+        let reference_port = i32::from(endpoints[0].port());
+        let targets: Vec<SocketAddr> = (port_start..=port_end)
+            .flat_map(|port| expand_punch_targets(&endpoints, port as i32 - reference_port))
+            .collect();
+        tracing::debug!(?targets, "send_punch_packet_easy_sym send to endpoints");
 
         for _ in 0..2 {
             send_symmetric_hole_punch_packet(
-                &ports,
+                &targets,
                 listener.clone(),
                 request.transaction_id,
-                &request.public_ips,
                 0,
-                ports.len(),
+                targets.len(),
             )
             .await
             .with_context(|| "failed to send symmetric hole punch packet")?;
@@ -218,11 +216,6 @@ where
                 "send_punch_packet_for_cone failed to find listener"
             ))?;
 
-        if request.public_ips.is_empty() {
-            tracing::warn!("try_punch_symmetric got zero len public ip");
-            anyhow::bail!("try_punch_symmetric got zero len public ip");
-        }
-
         let last_port_index = request.port_index as usize;
         let round = request.round.max(1);
         let mut max_k2: u32 = rand::thread_rng().gen_range(600..800);
@@ -230,15 +223,31 @@ where
             max_k2 = (max_k2 * 2 / round).max(MAX_K1_FOR_RANDOM_HARD_SYM);
         }
 
+        let endpoints = request_endpoints(&request.public_ips, &request.target_endpoints)?;
+        let reference_port = i32::from(endpoints[0].port());
+
         let mut next_port_index = 0;
         for _ in 0..2 {
+            // Walk the shuffled port list, translating each absolute port into
+            // the same offset on every egress. A CPE that maps egresses to
+            // different ports then still gets sprayed on each one's predicted
+            // ports, while a single-egress peer sees exactly the old sequence.
+            let mut targets = Vec::with_capacity(max_k2 as usize * endpoints.len());
+            let mut cursor = last_port_index;
+            for _ in 0..max_k2 {
+                let port = self.shuffled_port_vec[cursor % self.shuffled_port_vec.len()];
+                targets.extend(expand_punch_targets(
+                    &endpoints,
+                    i32::from(port) - reference_port,
+                ));
+                cursor = cursor.wrapping_add(1);
+            }
             next_port_index = send_symmetric_hole_punch_packet(
-                &self.shuffled_port_vec,
+                &targets,
                 listener.clone(),
                 request.transaction_id,
-                &request.public_ips,
                 last_port_index,
-                max_k2 as usize,
+                targets.len(),
             )
             .await
             .with_context(|| "failed to send symmetric hole punch packet randomly")?;
@@ -279,6 +288,7 @@ where
         Ok(SelectPunchListenerResponse {
             listener_mapped_addr: selected.mapped_addr,
             transaction_id: request.transaction_id,
+            endpoints: selected.mapped_addrs,
         })
     }
 
@@ -551,20 +561,39 @@ where
             let mut listeners = self.listeners.lock().await;
             let listener_count = listeners.len();
             let states = listener_reuse_states(listeners.as_slice());
+            // Prefer a listener that reaches an egress no listener has covered
+            // yet: behind a multi-WAN CPE the peers can only punch at addresses
+            // we advertise, so handing out the same egress every time leaves
+            // the other WANs unreachable.
+            let no_egress_covered = BTreeSet::new();
             let listener_idx = if prefer_port_mapping {
-                select_reusable_port_mapping_listener_idx(&states)
-                    .or_else(|| {
-                        if should_create && states.last().is_some_and(can_reuse_public_listener) {
-                            Some(states.len() - 1)
-                        } else {
-                            None
-                        }
-                    })
-                    .or_else(|| select_reusable_public_listener_idx(&states))
+                select_listener_covering_new_egress(
+                    &states,
+                    &no_egress_covered,
+                    can_reuse_port_mapping_listener,
+                )
+                .or_else(|| {
+                    if should_create && states.last().is_some_and(can_reuse_public_listener) {
+                        Some(states.len() - 1)
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| {
+                    select_listener_covering_new_egress(
+                        &states,
+                        &no_egress_covered,
+                        can_reuse_public_listener,
+                    )
+                })
             } else if should_create {
                 listeners.len().checked_sub(1)
             } else {
-                select_reusable_public_listener_idx(&states)
+                select_listener_covering_new_egress(
+                    &states,
+                    &no_egress_covered,
+                    can_reuse_public_listener,
+                )
             };
 
             let Some(listener_idx) = listener_idx else {
@@ -602,6 +631,7 @@ where
             return Some(SelectedUdpPunchListener {
                 socket: listener.get_socket(),
                 mapped_addr: listener.mapped_addr,
+                mapped_addrs: listener.mapped_addrs.clone(),
             });
         }
     }
@@ -614,6 +644,7 @@ struct UdpPunchListenerRecord<S> {
     connection_tasks: Arc<Mutex<JoinSet<()>>>,
     running: Arc<AtomicCell<bool>>,
     mapped_addr: SocketAddr,
+    mapped_addrs: Vec<SocketAddr>,
     has_port_mapping_lease: bool,
     _port_mapping_lease: Option<Box<dyn UdpPortMappingLease>>,
     conn_counter: Arc<dyn ListenerConnectionCounter>,
@@ -635,6 +666,7 @@ where
             socket,
             hole_punch_observers,
             mapped_addr,
+            mapped_addrs,
             conn_counter,
             mut acceptor,
             port_mapping_lease,
@@ -681,7 +713,11 @@ where
             }
         });
 
-        tracing::warn!(?mapped_addr, "udp hole punching listener started");
+        tracing::warn!(
+            ?mapped_addr,
+            ?mapped_addrs,
+            "udp hole punching listener started"
+        );
 
         Self {
             socket,
@@ -690,6 +726,7 @@ where
             connection_tasks,
             running,
             mapped_addr,
+            mapped_addrs,
             has_port_mapping_lease: port_mapping_lease.is_some(),
             _port_mapping_lease: port_mapping_lease,
             conn_counter,
@@ -713,6 +750,7 @@ where
         ReusableUdpPunchListener {
             running: self.running.load(),
             mapped_addr: self.mapped_addr,
+            mapped_addrs: self.mapped_addrs.clone(),
             has_port_mapping_lease: self.has_port_mapping_lease,
             last_active_time: self.last_active_time.load(),
         }
@@ -825,12 +863,17 @@ where
     Ok(())
 }
 
-#[tracing::instrument(err, ret(level = tracing::Level::DEBUG), skip(ports, udp))]
+/// Sends punch packets to concrete endpoints, cycling through them so a
+/// multi-WAN peer gets sprayed across every egress it advertised.
+///
+/// `targets` carries the full address per egress rather than an IP list plus a
+/// shared port, because a CPE that selects an egress per destination can map
+/// each one to a different public port.
+#[tracing::instrument(err, ret(level = tracing::Level::DEBUG), skip(targets, udp))]
 pub async fn send_symmetric_hole_punch_packet<S>(
-    ports: &[u16],
+    targets: &[SocketAddr],
     udp: Arc<S>,
     transaction_id: u32,
-    public_ips: &[Ipv4Addr],
     port_start_idx: usize,
     max_packets: usize,
 ) -> anyhow::Result<usize>
@@ -838,22 +881,67 @@ where
     S: VirtualUdpSocket + 'static,
 {
     tracing::debug!("sending hard symmetric hole punching packet");
+    let Some(first_target) = targets.first().copied() else {
+        anyhow::bail!("send_symmetric_hole_punch_packet got no targets");
+    };
     let mut sent_packets = 0;
-    let mut cur_port_idx = port_start_idx;
+    let mut cur_idx = port_start_idx;
     while sent_packets < max_packets {
-        let port = ports[cur_port_idx % ports.len()];
-        for pub_ip in public_ips {
-            let addr = SocketAddr::V4(SocketAddrV4::new(*pub_ip, port));
-            for _ in 0..3 {
-                let packet = new_hole_punch_packet(transaction_id, HOLE_PUNCH_PACKET_BODY_LEN);
-                udp.send_to(&packet.into_bytes(), addr).await?;
-            }
-            sent_packets += 1;
+        let addr = targets
+            .get(cur_idx % targets.len())
+            .copied()
+            .unwrap_or(first_target);
+        for _ in 0..3 {
+            let packet = new_hole_punch_packet(transaction_id, HOLE_PUNCH_PACKET_BODY_LEN);
+            udp.send_to(&packet.into_bytes(), addr).await?;
         }
-        cur_port_idx = cur_port_idx.wrapping_add(1);
+        sent_packets += 1;
+        cur_idx = cur_idx.wrapping_add(1);
         crate::foundation::time::sleep(Duration::from_millis(1)).await;
     }
-    Ok(cur_port_idx % ports.len())
+    Ok(cur_idx % targets.len())
+}
+
+/// Expands `(egress endpoints, port delta)` into concrete destinations.
+///
+/// The delta comes from the port-prediction strategy and is the same on every
+/// egress: one NAT device allocates ports in one sequence, so the offset from
+/// each egress's own mapped port is what carries over. Applying one absolute
+/// port to all egresses instead would only be right for the egress that port
+/// came from.
+pub fn expand_punch_targets(endpoints: &[SocketAddr], port_delta: i32) -> Vec<SocketAddr> {
+    endpoints
+        .iter()
+        .filter_map(|endpoint| {
+            let port = i64::from(endpoint.port()) + i64::from(port_delta);
+            let port = u16::try_from(port).ok()?;
+            Some(SocketAddr::new(endpoint.ip(), port))
+        })
+        .collect()
+}
+
+/// Resolves the endpoints a punch request targets.
+///
+/// `target_endpoints` carries one address per egress and is what a multi-WAN
+/// aware sender fills in. Older senders only fill `public_ips`, which shares
+/// one port across all egresses — correct for a single egress, and the best
+/// available guess otherwise.
+fn request_endpoints(
+    public_ips: &[Ipv4Addr],
+    target_endpoints: &[SocketAddr],
+) -> anyhow::Result<Vec<SocketAddr>> {
+    if !target_endpoints.is_empty() {
+        return Ok(target_endpoints.to_vec());
+    }
+    if public_ips.is_empty() {
+        anyhow::bail!("punch request has neither target endpoints nor public ips");
+    }
+    // Without per-egress ports the caller's own port prediction supplies them;
+    // port 0 is a placeholder that the caller's delta is applied to.
+    Ok(public_ips
+        .iter()
+        .map(|ip| SocketAddr::V4(SocketAddrV4::new(*ip, 0)))
+        .collect())
 }
 
 pub struct UdpBothEasySymPunchServer<R, T>
@@ -1125,8 +1213,10 @@ mod tests {
             &self,
             socket: Arc<Self::Socket>,
         ) -> anyhow::Result<UdpResolvedPublicAddr> {
+            let mapped_addr = socket.local_addr()?;
             Ok(UdpResolvedPublicAddr {
-                mapped_addr: socket.local_addr()?,
+                mapped_addr,
+                mapped_addrs: vec![mapped_addr],
                 port_mapping_lease: None,
             })
         }
@@ -1217,10 +1307,12 @@ mod tests {
             incoming_notify: tokio::sync::Notify::new(),
         });
         let layer = Arc::new(crate::socket::udp::UdpSessionLayer::new(socket.clone()));
+        let mapped_addr = SocketAddr::from(([203, 0, 113, 1], port));
         UdpPunchListener {
             socket,
             hole_punch_observers: layer.hole_punch_observers(),
-            mapped_addr: SocketAddr::from(([203, 0, 113, 1], port)),
+            mapped_addr,
+            mapped_addrs: vec![mapped_addr],
             conn_counter: Arc::new(MockCounter::default()),
             acceptor: Box::new(MockAcceptor {
                 sockets: sockets.into(),
@@ -1655,16 +1747,14 @@ mod tests {
             incoming: StdMutex::new(VecDeque::new()),
             incoming_notify: tokio::sync::Notify::new(),
         });
-        let next_idx = send_symmetric_hole_punch_packet(
-            &[10, 11, 12],
-            socket.clone(),
-            9,
-            &[Ipv4Addr::new(198, 51, 100, 1)],
-            1,
-            2,
-        )
-        .await
-        .unwrap();
+        let targets: Vec<SocketAddr> = vec![
+            "198.51.100.1:10".parse().unwrap(),
+            "198.51.100.1:11".parse().unwrap(),
+            "198.51.100.1:12".parse().unwrap(),
+        ];
+        let next_idx = send_symmetric_hole_punch_packet(&targets, socket.clone(), 9, 1, 2)
+            .await
+            .unwrap();
 
         assert_eq!(next_idx, 0);
         let sent = socket.sent.lock().await;
@@ -1684,10 +1774,9 @@ mod tests {
         });
 
         let err = send_symmetric_hole_punch_packet(
-            &[10],
+            &["198.51.100.1:10".parse().unwrap()],
             socket.clone(),
             9,
-            &[Ipv4Addr::new(198, 51, 100, 1)],
             0,
             1,
         )
@@ -1728,5 +1817,52 @@ mod tests {
             .unwrap();
         assert!(busy_response.is_busy);
         assert!(busy_response.base_mapped_addr.is_none());
+    }
+    #[test]
+    fn expand_punch_targets_offsets_every_egress_from_its_own_port() {
+        let endpoints: Vec<SocketAddr> = vec![
+            "203.0.113.1:5000".parse().unwrap(),
+            "198.51.100.1:6000".parse().unwrap(),
+        ];
+
+        assert_eq!(
+            expand_punch_targets(&endpoints, 2),
+            vec![
+                "203.0.113.1:5002".parse::<SocketAddr>().unwrap(),
+                "198.51.100.1:6002".parse::<SocketAddr>().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn expand_punch_targets_drops_out_of_range_ports() {
+        let endpoints: Vec<SocketAddr> = vec![
+            "203.0.113.1:5".parse().unwrap(),
+            "198.51.100.1:6000".parse().unwrap(),
+        ];
+
+        assert_eq!(
+            expand_punch_targets(&endpoints, -10),
+            vec!["198.51.100.1:5990".parse::<SocketAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn request_endpoints_prefers_per_egress_addresses() {
+        let public_ips: Vec<Ipv4Addr> = vec!["203.0.113.1".parse().unwrap()];
+        let endpoints: Vec<SocketAddr> = vec![
+            "203.0.113.1:5000".parse().unwrap(),
+            "198.51.100.1:6000".parse().unwrap(),
+        ];
+
+        assert_eq!(
+            request_endpoints(&public_ips, &endpoints).unwrap(),
+            endpoints
+        );
+    }
+
+    #[test]
+    fn request_endpoints_rejects_a_request_with_no_targets() {
+        assert!(request_endpoints(&[], &[]).is_err());
     }
 }

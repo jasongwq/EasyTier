@@ -43,22 +43,23 @@ impl UdpHolePunchPeerSource for PeerManagerCore {
         self.list_route_snapshots()
             .await
             .into_iter()
-            .filter_map(|route| {
+            .map(|route| {
+                let peer_supports_multi_egress = route
+                    .feature_flag
+                    .as_ref()
+                    .is_some_and(|flag| flag.multi_egress_v1);
                 let udp_nat_type = route
                     .stun_info
                     .as_ref()
-                    .map(|info| info.udp_nat_type)
-                    .unwrap_or_default();
-                let Ok(udp_nat_type) = crate::proto::common::NatType::try_from(udp_nat_type) else {
-                    return None;
-                };
-                Some(UdpPunchCandidate {
+                    .map(|info| info.effective_udp_nat_type(peer_supports_multi_egress))
+                    .unwrap_or(NatType::Unknown);
+                UdpPunchCandidate {
                     peer_id: route.peer_id,
                     udp_nat_type,
                     feature_flag: route.feature_flag,
                     has_direct_connection: peer_map.has_peer(route.peer_id),
                     has_recent_traffic: self.has_recent_traffic(route.peer_id, now),
-                })
+                }
             })
             .collect()
     }

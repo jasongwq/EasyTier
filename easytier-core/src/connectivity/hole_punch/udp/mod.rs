@@ -17,8 +17,7 @@ pub(crate) use common::{BLACKLIST_TIMEOUT_SEC, UdpNatType, UdpPunchClientMethod}
 pub(crate) use connector::{UdpHolePunchConnector, UdpSymPunchLock};
 pub(crate) use punch_listener::{
     MAX_PUBLIC_UDP_HOLE_PUNCH_LISTENERS, ReusableUdpPunchListener, can_reuse_port_mapping_listener,
-    can_reuse_public_listener, select_reusable_port_mapping_listener_idx,
-    select_reusable_public_listener_idx, should_create_public_listener,
+    can_reuse_public_listener, select_listener_covering_new_egress, should_create_public_listener,
     should_retry_public_listener_selection,
 };
 pub(crate) use rpc::UdpHolePunchRpcSource;
